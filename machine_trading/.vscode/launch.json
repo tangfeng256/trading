@@ -1,0 +1,296 @@
+{
+    "version": "0.2.0",
+
+    // ── HOW TO CUSTOMISE ────────────────────────────────────────────────────
+    // 1. Point --config at your real config file (edit the "args" array below).
+    // 2. Add or remove --set lines to override individual config fields, e.g.:
+    //      "--set", "ib.paper_port=7497",
+    //      "--set", "runtime.symbols=NVDA,TSLA"
+    // 3. For absorption/pullback you can also override --port and --client-id
+    //    directly in args without needing a config change.
+    // ────────────────────────────────────────────────────────────────────────
+
+    "configurations": [
+
+        // ════════════════════════════════════════════════════════════════════
+        // ORCHESTRATOR  (all three strategies on one account)
+        // ════════════════════════════════════════════════════════════════════
+
+        {
+            "name": "▶  Orchestrator — Paper",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/run.py",
+            "args": [
+                "orchestrator", "paper",
+                "--config", "configs/orchestrator.json",
+                "--set", "ib.paper_port=7497"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+
+        {
+            "name": "▶  Orchestrator — Paper (dry-run, signals only)",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/run.py",
+            "args": [
+                "orchestrator", "paper",
+                "--config", "configs/orchestrator.json",
+                "--dry-run",
+                "--set", "ib.paper_port=7497"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+
+        {
+            "name": "⚡ Orchestrator — LIVE  ⚠ real orders",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/run.py",
+            "args": [
+                "orchestrator", "live",
+                "--config", "configs/orchestrator.json",
+                "--set", "ib.live_port=7496"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+
+        {
+            "name": "🔍 Orchestrator — Debug Paper",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/run.py",
+            "args": [
+                "orchestrator", "paper",
+                "--config", "configs/orchestrator.json",
+                "--set", "ib.paper_port=7497"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "stopOnEntry": false
+        },
+
+        // ════════════════════════════════════════════════════════════════════
+        // ABSORPTION  (bid-side absorption reversal)
+        // ════════════════════════════════════════════════════════════════════
+
+        {
+            "name": "▶  Absorption — Paper",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/run.py",
+            "args": [
+                "absorption", "paper",
+                "--config", "configs/absorption.json",
+                "--port", "7497"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+
+        {
+            "name": "▶  Absorption — Paper (dry-run, signals only)",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/run.py",
+            "args": [
+                "absorption", "paper",
+                "--config", "configs/absorption.json",
+                "--dry-run",
+                "--port", "7497"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+
+        {
+            "name": "⚡ Absorption — LIVE  ⚠ real orders",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/run.py",
+            "args": [
+                "absorption", "live",
+                "--config", "configs/absorption.json",
+                "--port", "7496"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+
+        {
+            "name": "🔍 Absorption — Debug Paper",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/run.py",
+            "args": [
+                "absorption", "paper",
+                "--config", "configs/absorption.json",
+                "--port", "7497"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "stopOnEntry": false
+        },
+
+        // ════════════════════════════════════════════════════════════════════
+        // PULLBACK  (intraday pullback trend-following)
+        // ════════════════════════════════════════════════════════════════════
+
+        {
+            "name": "▶  Pullback — Paper",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/run.py",
+            "args": [
+                "pullback", "paper",
+                "--config", "configs/pullback.json",
+                "--port", "7497"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+
+        {
+            "name": "▶  Pullback — Paper (dry-run, signals only)",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/run.py",
+            "args": [
+                "pullback", "paper",
+                "--config", "configs/pullback.json",
+                "--dry-run",
+                "--port", "7497"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+
+        {
+            "name": "⚡ Pullback — LIVE  ⚠ real orders",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/run.py",
+            "args": [
+                "pullback", "live",
+                "--config", "configs/pullback.json",
+                "--port", "7496"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+
+        {
+            "name": "🔍 Pullback — Debug Paper",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/run.py",
+            "args": [
+                "pullback", "paper",
+                "--config", "configs/pullback.json",
+                "--port", "7497"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "stopOnEntry": false
+        },
+
+        // ════════════════════════════════════════════════════════════════════
+        // OPENING RANGE  (OR momentum breakout)
+        // ════════════════════════════════════════════════════════════════════
+
+        {
+            "name": "▶  Opening Range — Paper",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/run.py",
+            "args": [
+                "opening_range", "paper",
+                "--config", "configs/opening_range.json",
+                "--set", "ib.paper_port=7497"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+
+        {
+            "name": "▶  Opening Range — Paper (dry-run, signals only)",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/run.py",
+            "args": [
+                "opening_range", "paper",
+                "--config", "configs/opening_range.json",
+                "--dry-run",
+                "--set", "ib.paper_port=7497"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+
+        {
+            "name": "⚡ Opening Range — LIVE  ⚠ real orders",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/run.py",
+            "args": [
+                "opening_range", "live",
+                "--config", "configs/opening_range.json",
+                "--set", "ib.live_port=7496"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+
+        {
+            "name": "🔍 Opening Range — Debug Paper",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/run.py",
+            "args": [
+                "opening_range", "paper",
+                "--config", "configs/opening_range.json",
+                "--set", "ib.paper_port=7497"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "stopOnEntry": false
+        }
+
+    ]
+}

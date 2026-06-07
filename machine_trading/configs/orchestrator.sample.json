@@ -1,0 +1,45 @@
+{
+  "ib": {
+    "host": "127.0.0.1",
+    "paper_port": 7497,
+    "live_port": 7496,
+    "client_id": 41,
+    "exchange": "SMART",
+    "currency": "USD",
+    "primary_exchange": "NASDAQ",
+    "market_data_type": 1,
+    "depth_rows": 5,
+    "smart_depth": true,
+    "max_depth_requests": 3,
+    "depth_symbols": ["NVDA", "TSLA", "AMD"],
+    "trailing_stop_enabled": true,
+    "trailing_activation_bps": 50,
+    "trailing_distance_bps": 35,
+    "trailing_min_step_bps": 5,
+    "runner_target_enabled": true,
+    "runner_target_r_multiple": 6,
+    "historical_duration": "2 D",
+    "bar_size": "1 min",
+    "use_rth": true,
+    "heartbeat_seconds": 30
+  },
+  "strategy_files": {
+    "absorption": "C:\\src\\trading\\absorption_reveral\\absorption\\config.sample.json",
+    "pullback": "C:\\src\\trading\\intraday_pullback_trend_following\\config.json",
+    "opening_range": "C:\\src\\trading\\opening_range_momentum\\config.json"
+  },
+  "runtime": {
+    "symbols": ["NVDA", "TSLA", "AMD", "TQQQ"],
+    "enabled_strategies": ["opening_range", "pullback", "absorption"],
+    "strategy_priority": ["opening_range", "pullback", "absorption"],
+    "trading_timezone": "America/New_York",
+    "trading_start": "09:30:00",
+    "trading_end": "11:00:00",
+    "flatten_before_window_end_seconds": 60,
+    "post_window_position_check_seconds": 30,
+    "lock_on_entry_order": true,
+    "live_trading_enabled": false,
+    "dry_run": false,
+    "log_root": "runs"
+  }
+}

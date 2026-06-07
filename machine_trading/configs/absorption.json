@@ -1,0 +1,54 @@
+{
+  "ib": {
+    "host": "127.0.0.1",
+    "port": 7497,
+    "client_id": 17,
+    "connect_timeout_sec": 15
+  },
+  "symbols": ["NVDA", "TSLA", "AMD", "TQQQ"],
+  "market": {
+    "exchange": "SMART",
+    "currency": "USD",
+    "primary_exchange": "NASDAQ",
+    "depth_rows": 5,
+    "tick_size": 0.01
+  },
+  "strategy": {
+    "trade_start": "09:30:00",
+    "trade_end": "11:30:00",
+    "feature_interval_ms": 500,
+    "min_absorption_score": 0.70,
+    "min_exhaustion_score": 0.60,
+    "min_trigger_score": 0.65,
+    "min_breakout_ticks": 2,
+    "max_spread_bps": 6,
+    "absorption_window_sec": 10,
+    "exhaustion_window_sec": 5,
+    "trigger_window_sec": 3,
+    "max_hold_minutes": 30
+  },
+  "risk": {
+    "account_equity": 50000,
+    "risk_per_trade_pct": 0.0025,
+    "max_daily_loss_pct": 0.01,
+    "max_notional": 25000,
+    "max_trades_per_day": 3,
+    "min_stop_bps": 5,
+    "max_stop_bps": 60
+  },
+  "execution": {
+    "entry_order_type": "LMT",
+    "entry_price_offset_ticks": 1,
+    "stale_entry_seconds": 8,
+    "tp1_r_multiple": 1.0,
+    "tp1_fraction": 0.5,
+    "tp2_r_multiple": 2.0,
+    "move_stop_to_breakeven_after_tp1": true
+  },
+  "logging": {
+    "root": "runs",
+    "log_depth": true,
+    "log_tape": true,
+    "log_features": true
+  }
+}

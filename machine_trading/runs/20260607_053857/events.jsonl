@@ -1,0 +1,3 @@
+{"logged_at": "2026-06-07T05:38:58.088784+00:00", "positions": [{"avg_price": 0.0, "con_id": 4815747, "quantity": 0, "sec_type": "STK", "symbol": "NVDA"}, {"avg_price": 0.0, "con_id": 76792991, "quantity": 0, "sec_type": "STK", "symbol": "TSLA"}], "time": "2026-06-07T05:38:58.087785+00:00", "type": "account_positions_snapshot"}
+{"l1_only": ["TQQQ", "QQQ", "SPY"], "logged_at": "2026-06-07T05:38:58.088784+00:00", "max_depth_requests": 3, "selected": ["NVDA", "TSLA", "AMD"], "type": "depth_subscription_limit"}
+{"logged_at": "2026-06-07T05:39:17.729663+00:00", "mode": "paper", "strategies": ["opening_range", "pullback", "absorption"], "symbols": ["AMD", "NVDA", "QQQ", "SPY", "TQQQ", "TSLA"], "type": "session_started"}

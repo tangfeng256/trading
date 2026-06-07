@@ -1,0 +1,58 @@
+{
+  "strategy": {
+    "symbols": ["NVDA", "TSLA", "AMD", "AAPL", "TQQQ"],
+    "or_start": "09:30",
+    "or_end": "09:45",
+    "trade_start": "09:45",
+    "trade_end": "11:30",
+    "max_hold_minutes": 30,
+    "max_spread_bps": 8.0,
+    "min_volume": 100000,
+    "min_rel_volume": 1.2,
+    "min_or_move_bps": 35.0,
+    "min_reignite_volume_mult": 1.25,
+    "close_location_min": 0.65,
+    "or_reclaim_tolerance_bps": 8.0,
+    "volatility_buffer_mult": 0.25,
+    "market_symbols": ["QQQ", "SPY"],
+    "market_negative_bps": -45.0,
+    "use_l2": false
+  },
+  "ib": {
+    "host": "127.0.0.1",
+    "paper_port": 7497,
+    "live_port": 7496,
+    "client_id": 31,
+    "exchange": "SMART",
+    "currency": "USD",
+    "market_data_type": 1,
+    "depth_rows": 5,
+    "smart_depth": false,
+    "reconnect_attempts": 5,
+    "reconnect_sleep_seconds": 3.0
+  },
+  "risk": {
+    "account_size": 50000.0,
+    "risk_per_trade_pct": 0.003,
+    "max_daily_loss_pct": 0.01,
+    "max_trades_per_day": 3,
+    "max_total_positions": 3,
+    "max_position_notional": 25000.0,
+    "min_stop_bps": 8.0,
+    "max_stop_bps": 120.0,
+    "entry_stale_seconds": 8,
+    "max_slippage_bps": 5.0,
+    "tp1_fraction": 0.5,
+    "tp1_r": 1.0,
+    "tp2_r": 2.0,
+    "breakeven_buffer_bps": 2.0,
+    "commission_per_share": 0.005,
+    "slippage_bps": 2.0,
+    "kill_switch_file": "KILL_SWITCH"
+  },
+  "logging": {
+    "base_dir": "runs",
+    "run_id": null,
+    "write_book_snapshots": true
+  }
+}

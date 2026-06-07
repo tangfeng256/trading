@@ -1,0 +1,39 @@
+{
+  "strategy": {
+    "symbols": ["NVDA", "TSLA", "AMD", "TQQQ"],
+    "market_symbol": "QQQ",
+    "trade_windows": [["09:35", "11:30"], ["14:00", "15:30"]],
+    "min_score": 0.72,
+    "min_rvol": 1.5,
+    "use_l2": true,
+    "min_l2_total_size": 100,
+    "min_l2_imbalance": -0.10
+  },
+  "risk": {
+    "account_size": 50000,
+    "risk_per_trade_pct": 0.0035,
+    "max_daily_loss_pct": 0.01,
+    "max_trades_per_day": 3,
+    "max_consecutive_losses": 2,
+    "max_open_positions": 1
+  },
+  "execution": {
+    "tp1_r": 0.5,
+    "tp2_r": 1.2,
+    "tp1_fraction": 0.5,
+    "live_trading_enabled": false
+  },
+  "ib": {
+    "host": "127.0.0.1",
+    "port": 7497,
+    "client_id": 21,
+    "request_streaming_quotes": false,
+    "market_depth_rows": 5,
+    "smart_depth": false,
+    "heartbeat_seconds": 30
+  },
+  "logging": {
+    "base_dir": "runs",
+    "run_id": null
+  }
+}
