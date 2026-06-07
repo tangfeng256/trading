@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest_tmp/
+runs/
+backtest_output/
+
+# Local runtime state and machine-specific configs.
+*.local.json
+.env
