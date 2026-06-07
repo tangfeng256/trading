@@ -35,9 +35,9 @@ class IBConfig:
 
 @dataclass
 class StrategyFiles:
-    absorption: str = r"C:\src\trading\absorption_reveral\absorption\config.sample.json"
-    pullback: str = r"C:\src\trading\intraday_pullback_trend_following\config.json"
-    opening_range: str = r"C:\src\trading\opening_range_momentum\config.json"
+    absorption: str = "configs/absorption.json"
+    pullback: str = "configs/pullback.json"
+    opening_range: str = "configs/opening_range.json"
 
 
 @dataclass
@@ -52,6 +52,7 @@ class RuntimeConfig:
     post_window_position_check_seconds: int = 30
     forced_flatten_cooldown_seconds: int = 3600
     lock_on_entry_order: bool = True
+    manage_account_positions: bool = False
     live_trading_enabled: bool = False
     dry_run: bool = False
     log_root: str = "runs"

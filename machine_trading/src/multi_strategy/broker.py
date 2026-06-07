@@ -48,6 +48,7 @@ class SharedBroker:
         runner_target_enabled: bool = True,
         runner_target_r_multiple: float = 6.0,
         forced_flatten_cooldown_seconds: int = 3600,
+        manage_account_positions: bool = True,
     ) -> None:
         self.ib = ib
         self.contracts = contracts
@@ -62,6 +63,7 @@ class SharedBroker:
         self.runner_target_enabled = runner_target_enabled
         self.runner_target_r_multiple = runner_target_r_multiple
         self.forced_flatten_cooldown_seconds = forced_flatten_cooldown_seconds
+        self.manage_account_positions = manage_account_positions
         self.tracked_by_ib_id: dict[int, TrackedOrder] = {}
         self.tracked_by_ref: dict[str, TrackedOrder] = {}
         self.long_positions: dict[tuple[str, str], int] = {}
@@ -117,6 +119,26 @@ class SharedBroker:
 
     def sync_account_positions(self, timestamp: datetime) -> None:
         positions = [] if self.dry_run else self._account_positions()
+        if not self.manage_account_positions:
+            snapshot = []
+            for position in positions:
+                contract = getattr(position, "contract", None)
+                symbol = str(getattr(contract, "symbol", "") or "")
+                if not symbol:
+                    continue
+                if contract is not None:
+                    self.account_contracts[symbol] = contract
+                snapshot.append(
+                    {
+                        "symbol": symbol,
+                        "quantity": int(float(getattr(position, "position", 0) or 0)),
+                        "avg_price": float(getattr(position, "avgCost", 0.0) or 0.0),
+                        "sec_type": str(getattr(contract, "secType", "") or ""),
+                        "con_id": getattr(contract, "conId", ""),
+                    }
+                )
+            self.logger.event("account_positions_snapshot", {"positions": snapshot, "time": timestamp.isoformat(), "managed": False})
+            return
         seen_account_symbols = set()
         synced = []
         snapshot = []

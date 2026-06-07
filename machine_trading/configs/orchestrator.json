@@ -24,9 +24,9 @@
     "heartbeat_seconds": 30
   },
   "strategy_files": {
-    "absorption": "C:\\src\\trading\\absorption_reveral\\absorption\\config.sample.json",
-    "pullback": "C:\\src\\trading\\intraday_pullback_trend_following\\config.json",
-    "opening_range": "C:\\src\\trading\\opening_range_momentum\\config.json"
+    "absorption": "configs/absorption.json",
+    "pullback": "configs/pullback.json",
+    "opening_range": "configs/opening_range.json"
   },
   "runtime": {
     "symbols": ["NVDA", "TSLA", "AMD", "TQQQ"],
@@ -38,6 +38,7 @@
     "flatten_before_window_end_seconds": 60,
     "post_window_position_check_seconds": 30,
     "lock_on_entry_order": true,
+    "manage_account_positions": false,
     "live_trading_enabled": false,
     "dry_run": false,
     "log_root": "runs"
