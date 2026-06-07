@@ -156,6 +156,7 @@ class MultiStrategyRunner:
             runner_target_enabled=self.config.ib.runner_target_enabled,
             runner_target_r_multiple=self.config.ib.runner_target_r_multiple,
             forced_flatten_cooldown_seconds=self.config.runtime.forced_flatten_cooldown_seconds,
+            manage_account_positions=self.config.runtime.manage_account_positions,
         )
         factories = {
             "opening_range": lambda: OpeningRangeAdapter(self.config.strategy_files.opening_range, self.config.runtime.symbols, self.broker, self.registry, self.logger),

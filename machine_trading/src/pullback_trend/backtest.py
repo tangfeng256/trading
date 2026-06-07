@@ -17,6 +17,7 @@ from .signal_engine import SignalEngine
 def run_backtest(config: AppConfig, bars_path: str | Path | list[str | Path]) -> Path:
     bars = load_bars(bars_path)
     logger = AuditLogger(config.logging.base_dir, config.logging.run_id)
+    logger.ensure_outputs()
     risk = RiskManager(config.risk)
     orders = OrderManager(config.execution, logger)
     positions = PositionManager(config.strategy, config.execution, risk, orders, logger)

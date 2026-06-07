@@ -26,6 +26,11 @@ class AuditLogger:
     def position(self, **row: Any) -> None:
         self._write("positions.csv", ["timestamp", "symbol", "state", "quantity", "avg_price", "stop_price", "tp1_price", "tp2_price", "realized_pnl"], row)
 
+    def ensure_outputs(self) -> None:
+        self._ensure("decisions.csv", ["timestamp", "symbol", "approved", "reason", "score", "features"])
+        self._ensure("orders.csv", ["timestamp", "symbol", "event", "order_id", "side", "quantity", "price", "status", "reason", "parent_id"])
+        self._ensure("trades.csv", ["timestamp", "symbol", "event", "quantity", "price", "pnl", "reason"])
+
     def summary(self, data: dict[str, Any]) -> None:
         (self.run_dir / "summary.json").write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
 
@@ -35,11 +40,16 @@ class AuditLogger:
         self._files.clear()
 
     def _write(self, name: str, columns: list[str], row: dict[str, Any]) -> None:
-        if name not in self._files:
-            handle = (self.run_dir / name).open("w", newline="", encoding="utf-8")
-            writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
-            writer.writeheader()
-            self._files[name] = (handle, writer)
+        self._ensure(name, columns)
         clean = {key: (json.dumps(value, default=str) if isinstance(value, (dict, list)) else value) for key, value in row.items()}
         self._files[name][1].writerow(clean)
         self._files[name][0].flush()
+
+    def _ensure(self, name: str, columns: list[str]) -> None:
+        if name in self._files:
+            return
+        handle = (self.run_dir / name).open("w", newline="", encoding="utf-8")
+        writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        handle.flush()
+        self._files[name] = (handle, writer)

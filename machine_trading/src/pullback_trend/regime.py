@@ -15,6 +15,7 @@ def market_regime_ok(market_row: pd.Series | None, config: StrategyConfig) -> tu
     atr_bps = market_row["atr14"] / market_row["close"] * 10_000
     if atr_bps < config.atr_compression_floor_bps:
         return False, "market_atr_compressed", 0.2
-    if market_row["rvol"] < config.min_market_rvol:
+    market_rvol = float(market_row.get("rvol", 1.0))
+    if market_rvol < config.min_market_rvol:
         return False, "market_volume_low", 0.3
     return True, "market_regime_ok", 1.0
