@@ -10,6 +10,13 @@ from multi_strategy.paths import add_strategy_paths
 add_strategy_paths()
 
 from absorption.order_state import Signal as AbsorptionSignal  # noqa: E402
+from absorption.order_state import TradeStatus as AbsTradeStatus  # noqa: E402
+from absorption.config import ExecutionConfig as AbsExecutionConfig  # noqa: E402
+from absorption.config import MarketConfig as AbsMarketConfig  # noqa: E402
+from absorption.config import RiskConfig as AbsRiskConfig  # noqa: E402
+from absorption.config import StrategyConfig as AbsStrategyConfig  # noqa: E402
+from absorption.execution_manager import ExecutionManager as AbsExecutionManager  # noqa: E402
+from absorption.risk_manager import RiskManager as AbsRiskManager  # noqa: E402
 
 
 class _Event:
@@ -473,6 +480,44 @@ def test_absorption_on_broker_fill_ignores_unknown_order_id():
     adapter.execution = type("Execution", (), {"orders": {}})()
 
     adapter.on_broker_fill("ghost-order", datetime(2026, 6, 2, 14, 0, tzinfo=timezone.utc), 100, 200.0)
+
+
+def test_absorption_forced_flatten_fill_clears_risk_state():
+    timestamp = datetime(2026, 6, 11, 13, 30, tzinfo=timezone.utc)
+    signal = AbsorptionSignal(
+        symbol="NVDA",
+        timestamp=timestamp,
+        phase="long",
+        entry_ref_price=202.49,
+        absorption_level=202.40,
+        stop_price=201.97,
+        target1_price=203.23,
+        target2_price=203.99,
+        confidence=0.8,
+        reason_codes=[],
+        feature_snapshot={"spread_bps": 1.0},
+    )
+    adapter = AbsorptionAdapter.__new__(AbsorptionAdapter)
+    adapter.execution = AbsExecutionManager(AbsExecutionConfig(), AbsMarketConfig(), AbsStrategyConfig())
+    adapter.risk = AbsRiskManager(AbsRiskConfig(), AbsStrategyConfig())
+    adapter.registry = PositionRegistry()
+
+    trade = adapter.execution.submit_entry(signal, 123)
+    adapter.execution.on_fill(trade.entry_order_id, 123, 202.39, timestamp)
+    adapter.risk.mark_trade_opened("NVDA", timestamp)
+    adapter.registry.lock_position("NVDA", "absorption", timestamp)
+
+    adapter.on_broker_fill(
+        "flatten-absorption-NVDA-20260611133143",
+        datetime(2026, 6, 11, 13, 31, 43, tzinfo=timezone.utc),
+        123,
+        201.89,
+    )
+
+    assert "NVDA" not in adapter.risk.active_symbols
+    assert adapter.registry.owner("NVDA") is None
+    assert trade.status == AbsTradeStatus.CLOSED
+    assert trade.realized_pnl < 0
 
 
 def test_pullback_on_broker_fill_ignores_unknown_order_id():
