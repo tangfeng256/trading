@@ -21,6 +21,7 @@ from absorption.features import FeatureEngine as AbsFeatureEngine  # noqa: E402
 from absorption.risk_manager import RiskManager as AbsRiskManager  # noqa: E402
 from absorption.signal_engine import SignalEngine as AbsSignalEngine  # noqa: E402
 from absorption.tape import Tape  # noqa: E402
+from absorption.order_state import TradeStatus as AbsTradeStatus  # noqa: E402
 from pullback_trend.config import load_config as load_pullback_config  # noqa: E402
 from pullback_trend.execution import _append_bar as pullback_append_bar  # noqa: E402
 from pullback_trend.logger import AuditLogger as PullbackLogger  # noqa: E402
@@ -162,6 +163,9 @@ class AbsorptionAdapter(StrategyAdapter):
 
     def on_broker_fill(self, order_id: str, timestamp: datetime, quantity: int, price: float, commission: float = 0.0) -> None:
         if order_id not in self.execution.orders:
+            symbol = self._symbol_from_broker_flatten(order_id)
+            if symbol:
+                self._close_symbol_after_broker_flatten(symbol, timestamp, price)
             return
         created = self.execution.on_fill(order_id, quantity, price, timestamp)
         order = self.execution.orders[order_id]
@@ -174,6 +178,33 @@ class AbsorptionAdapter(StrategyAdapter):
         if trade and not trade.is_active:
             self.risk.mark_trade_closed(trade.symbol, timestamp, trade.realized_pnl)
             self.registry.unlock_if_owner(trade.symbol, self.strategy_name)
+
+    def _symbol_from_broker_flatten(self, order_id: str) -> str | None:
+        prefix = f"flatten-{self.strategy_name}-"
+        if not order_id.startswith(prefix):
+            return None
+        remainder = order_id[len(prefix):]
+        if "-" not in remainder:
+            return None
+        return remainder.split("-", 1)[0]
+
+    def _close_symbol_after_broker_flatten(self, symbol: str, timestamp: datetime, fill_price: float) -> None:
+        realized_pnl = 0.0
+        closed_any = False
+        for trade in self.execution.trades.values():
+            if trade.symbol != symbol or not trade.is_active:
+                continue
+            entry_order = self.execution.orders.get(trade.entry_order_id)
+            entry_price = float(getattr(entry_order, "avg_fill_price", 0.0) or trade.entry_price)
+            sold_qty = sum(order.filled_qty for order in trade.orders.values() if order.side == "SELL")
+            remaining_qty = max(0, trade.filled_qty - sold_qty)
+            realized_pnl += (fill_price - entry_price) * remaining_qty
+            trade.realized_pnl += (fill_price - entry_price) * remaining_qty
+            trade.status = AbsTradeStatus.CLOSED
+            closed_any = True
+        if closed_any or symbol in self.risk.active_symbols:
+            self.risk.mark_trade_closed(symbol, timestamp, realized_pnl)
+        self.registry.unlock_if_owner(symbol, self.strategy_name)
 
     def _widen_exit_plan(self, signal: Any, features: dict[str, Any]) -> Any:
         entry = float(signal.entry_ref_price)

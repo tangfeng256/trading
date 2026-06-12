@@ -49,16 +49,37 @@ class _Fill:
         self.commissionReport = None
 
 
-class _FillEvent:
+class _Event:
+    def __init__(self):
+        self.handlers = []
+
     def __iadd__(self, handler):
+        self.handlers.append(handler)
         self.handler = handler
         return self
 
+    def fire(self, *args):
+        for handler in list(self.handlers):
+            handler(*args)
+
 
 class _Trade:
-    def __init__(self, order):
+    def __init__(self, order, contract=None):
         self.order = order
-        self.fillEvent = _FillEvent()
+        self.contract = contract
+        self.fillEvent = _Event()
+        self.orderStatus = type(
+            "Status",
+            (),
+            {
+                "status": "Submitted",
+                "filled": 0,
+                "remaining": getattr(order, "totalQuantity", 0),
+                "avgFillPrice": 0.0,
+                "lastFillPrice": 0.0,
+                "whyHeld": "",
+            },
+        )()
 
 
 class _Contract:
@@ -80,6 +101,10 @@ class _IB:
         self.modifications = []
         self.cancelled = []
         self.account_positions = []
+        self.openOrderEvent = _Event()
+        self.orderStatusEvent = _Event()
+        self.execDetailsEvent = _Event()
+        self.commissionReportEvent = _Event()
 
     def placeOrder(self, contract, order):
         if order.orderId is not None:
@@ -87,7 +112,7 @@ class _IB:
             return next(trade for trade in self.trade_list if trade.order is order)
         order.orderId = len(self.orders) + 1
         self.orders.append(order)
-        trade = _Trade(order)
+        trade = _Trade(order, contract)
         self.trade_list.append(trade)
         return trade
 
@@ -258,6 +283,61 @@ def test_shared_broker_logs_partial_and_full_fill_statuses():
 
     assert [row["filled_status"] for row in entry_rows] == ["no-fill", "partial fill", "full fill"]
     assert [row["filled_quantity"] for row in entry_rows] == [0, 40, 100]
+
+
+def test_shared_broker_logs_ib_order_lifecycle_events():
+    ib = _IB()
+    logger = _Logger()
+    receiver = _Receiver()
+    broker = SharedBroker(ib, {"NVDA": _Contract("NVDA")}, PositionRegistry(), logger)
+
+    broker._place(receiver, "NVDA", "entry-1", "entry", _Order("BUY", 100, limit_price=200.0))
+    trade = ib.trade_list[-1]
+    trade.orderStatus.status = "Submitted"
+    trade.orderStatus.remaining = 100
+
+    ib.openOrderEvent.fire(trade)
+    ib.orderStatusEvent.fire(trade)
+    fill = _Fill(40, 200.0)
+    fill.execution.orderId = trade.order.orderId
+    fill.execution.permId = 12345
+    fill.execution.execId = "exec-1"
+    fill.execution.side = "BOT"
+    fill.execution.avgPrice = 200.0
+    fill.execution.exchange = "NASDAQ"
+    fill.contract = _Contract("NVDA")
+    fill.commissionReport = type("Report", (), {"execId": "exec-1", "commission": 0.25, "currency": "USD", "realizedPNL": 0.0})()
+
+    ib.execDetailsEvent.fire(trade, fill)
+    ib.commissionReportEvent.fire(fill.commissionReport)
+
+    open_rows = [row for name, row in logger.rows if name == "broker_open_orders"]
+    status_rows = [row for name, row in logger.rows if name == "broker_order_status"]
+    execution_rows = [row for name, row in logger.rows if name == "broker_executions"]
+    commission_rows = [row for name, row in logger.rows if name == "broker_commissions"]
+
+    assert any(row["source"] == "place_order_return" and row["order_id"] == "entry-1" for row in open_rows)
+    assert any(row["source"] == "openOrderEvent" and row["ib_order_id"] == trade.order.orderId for row in open_rows)
+    assert any(row["source"] == "orderStatusEvent" and row["status"] == "Submitted" for row in status_rows)
+    assert execution_rows == [
+        {
+            "timestamp": fill.execution.time,
+            "source": "execDetailsEvent",
+            "symbol": "NVDA",
+            "order_id": "entry-1",
+            "ib_order_id": trade.order.orderId,
+            "perm_id": 12345,
+            "exec_id": "exec-1",
+            "side": "BOT",
+            "shares": 40,
+            "price": 200.0,
+            "avg_price": 200.0,
+            "exchange": "NASDAQ",
+            "commission": 0.25,
+        }
+    ]
+    assert commission_rows[0]["exec_id"] == "exec-1"
+    assert commission_rows[0]["commission"] == 0.25
 
 
 def test_shared_broker_rejects_new_entry_while_long_inventory_remains():
@@ -621,6 +701,25 @@ def test_shared_broker_tracks_avg_price_correctly_across_partial_fills():
 
     # (199.50 * 40 + 200.50 * 60) / 100 = 200.10
     assert broker.long_avg_prices[("absorption", "NVDA")] == 200.10
+
+
+def test_shared_broker_syncs_stop_quantity_after_late_entry_partial_fill():
+    ib = _IB()
+    logger = _Logger()
+    receiver = _Receiver()
+    broker = SharedBroker(ib, {"NVDA": object()}, PositionRegistry(), logger)
+
+    broker._place(receiver, "NVDA", "entry-1", "entry", _Order("BUY", 123, limit_price=202.49))
+    broker._on_fill("entry-1", _Fill(100, 202.41))
+    broker._place(receiver, "NVDA", "stop-5", "stop", _Order("SELL", 100, order_type="STP", stop_price=201.97))
+
+    broker._on_fill("entry-1", _Fill(23, 202.32))
+
+    stop = ib.orders[1]
+    assert broker.long_positions[("absorption", "NVDA")] == 123
+    assert stop.totalQuantity == 123
+    assert stop in ib.modifications
+    assert any(event[0] == "stop_quantity_updated" for event in logger.events)
 
 
 def test_shared_broker_lock_or_raise_does_not_raise_when_same_strategy_holds_open_lock():

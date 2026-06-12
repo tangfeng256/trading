@@ -86,6 +86,7 @@ class SharedBroker:
         self.order_filled_quantities: dict[str, int] = {}
         self.current_stop_prices: dict[tuple[str, str], float] = {}
         self._seen_exec_ids: set[str] = set()
+        self._bind_ib_lifecycle_events()
 
     def submit_pullback_entry(self, receiver: FillReceiver, order: Any, signal: Any) -> None:
         self._lock_or_raise(order.symbol, receiver.strategy_name, order.created_at, "pullback_entry")
@@ -300,6 +301,8 @@ class SharedBroker:
         ib_id = getattr(getattr(trade, "order", ib_order), "orderId", None)
         if ib_id is not None:
             self.tracked_by_ib_id[ib_id] = tracked
+        self._log_broker_open_order(trade, source="place_order_return")
+        self._log_broker_order_status(trade, source="place_order_return")
         fill_event = getattr(trade, "fillEvent", None)
         if fill_event is not None:
             fill_event += lambda trade, fill, oid=order_id: self._on_fill(oid, fill)
@@ -477,6 +480,7 @@ class SharedBroker:
             if new_qty > 0:
                 self.long_avg_prices[key] = ((old_avg * old_qty) + (fill_price * quantity)) / new_qty if fill_price else old_avg
                 self.position_receivers[key] = tracked.receiver
+                self._sync_stop_quantity(tracked.strategy, tracked.symbol, new_qty)
             return
         if tracked.action != "SELL":
             return
@@ -963,3 +967,164 @@ class SharedBroker:
         if order.order_type == "STP":
             return self._stop_order(order.side, order.qty, order.stop_price)
         return self._limit_order(order.side, order.qty, order.price)
+
+    # ------------------------------------------------------------------
+    # Broker lifecycle audit logging
+    # ------------------------------------------------------------------
+
+    def _bind_ib_lifecycle_events(self) -> None:
+        if self.dry_run:
+            return
+        bindings = {
+            "openOrderEvent": self._on_ib_open_order_event,
+            "orderStatusEvent": self._on_ib_order_status_event,
+            "execDetailsEvent": self._on_ib_exec_details_event,
+            "commissionReportEvent": self._on_ib_commission_report_event,
+        }
+        for event_name, handler in bindings.items():
+            event = getattr(self.ib, event_name, None)
+            if event is None:
+                continue
+            try:
+                event += handler
+            except Exception as exc:
+                self.logger.event("broker_lifecycle_event_bind_failed", {"event": event_name, "error": str(exc)})
+
+    def _on_ib_open_order_event(self, *args: Any) -> None:
+        trade = self._trade_from_event_args(args)
+        if trade is None:
+            self._log_broker_event_args("broker_open_orders", "openOrderEvent", args)
+            return
+        self._log_broker_open_order(trade, source="openOrderEvent")
+
+    def _on_ib_order_status_event(self, *args: Any) -> None:
+        trade = self._trade_from_event_args(args)
+        if trade is None:
+            self._log_broker_event_args("broker_order_status", "orderStatusEvent", args)
+            return
+        self._log_broker_order_status(trade, source="orderStatusEvent")
+
+    def _on_ib_exec_details_event(self, *args: Any) -> None:
+        trade, fill = self._trade_and_fill_from_event_args(args)
+        if fill is None:
+            self._log_broker_event_args("broker_executions", "execDetailsEvent", args)
+            return
+        self._log_broker_execution(trade, fill, source="execDetailsEvent")
+
+    def _on_ib_commission_report_event(self, *args: Any) -> None:
+        report = args[-1] if args else None
+        self._log_broker_commission(report, source="commissionReportEvent")
+
+    def _trade_from_event_args(self, args: tuple[Any, ...]) -> Any | None:
+        for arg in args:
+            if hasattr(arg, "order") and hasattr(arg, "orderStatus"):
+                return arg
+        return None
+
+    def _trade_and_fill_from_event_args(self, args: tuple[Any, ...]) -> tuple[Any | None, Any | None]:
+        trade = self._trade_from_event_args(args)
+        fill = None
+        for arg in args:
+            if hasattr(arg, "execution"):
+                fill = arg
+                break
+        return trade, fill
+
+    def _log_broker_open_order(self, trade: Any, *, source: str) -> None:
+        order = getattr(trade, "order", None)
+        if order is None:
+            return
+        self.logger.csv("broker_open_orders", {**self._broker_order_row(trade), "source": source})
+
+    def _log_broker_order_status(self, trade: Any, *, source: str) -> None:
+        order = getattr(trade, "order", None)
+        status = getattr(trade, "orderStatus", None)
+        if order is None and status is None:
+            return
+        self.logger.csv("broker_order_status", {**self._broker_order_row(trade), "source": source})
+
+    def _log_broker_execution(self, trade: Any | None, fill: Any, *, source: str) -> None:
+        execution = getattr(fill, "execution", None)
+        if execution is None:
+            return
+        contract = getattr(fill, "contract", None) or getattr(trade, "contract", None)
+        order = getattr(trade, "order", None)
+        report = getattr(fill, "commissionReport", None)
+        self.logger.csv(
+            "broker_executions",
+            {
+                "timestamp": getattr(execution, "time", None) or datetime.now(timezone.utc),
+                "source": source,
+                "symbol": getattr(contract, "symbol", ""),
+                "order_id": getattr(order, "orderRef", "") or self._order_ref_for_ib_id(getattr(execution, "orderId", None)),
+                "ib_order_id": getattr(execution, "orderId", ""),
+                "perm_id": getattr(execution, "permId", getattr(order, "permId", "")),
+                "exec_id": getattr(execution, "execId", ""),
+                "side": getattr(execution, "side", ""),
+                "shares": getattr(execution, "shares", ""),
+                "price": getattr(execution, "price", ""),
+                "avg_price": getattr(execution, "avgPrice", ""),
+                "exchange": getattr(execution, "exchange", ""),
+                "commission": getattr(report, "commission", ""),
+            },
+        )
+
+    def _log_broker_commission(self, report: Any, *, source: str) -> None:
+        if report is None:
+            return
+        self.logger.csv(
+            "broker_commissions",
+            {
+                "timestamp": datetime.now(timezone.utc),
+                "source": source,
+                "exec_id": getattr(report, "execId", ""),
+                "commission": getattr(report, "commission", ""),
+                "currency": getattr(report, "currency", ""),
+                "realized_pnl": getattr(report, "realizedPNL", ""),
+                "yield": getattr(report, "yield_", getattr(report, "yield", "")),
+                "yield_redemption_date": getattr(report, "yieldRedemptionDate", ""),
+            },
+        )
+
+    def _broker_order_row(self, trade: Any) -> dict[str, Any]:
+        order = getattr(trade, "order", None)
+        status = getattr(trade, "orderStatus", None)
+        contract = getattr(trade, "contract", None)
+        ib_order_id = getattr(order, "orderId", "")
+        return {
+            "timestamp": datetime.now(timezone.utc),
+            "symbol": getattr(contract, "symbol", ""),
+            "order_id": getattr(order, "orderRef", "") or self._order_ref_for_ib_id(ib_order_id),
+            "ib_order_id": ib_order_id,
+            "perm_id": getattr(order, "permId", ""),
+            "client_id": getattr(order, "clientId", ""),
+            "action": getattr(order, "action", ""),
+            "order_type": getattr(order, "orderType", ""),
+            "quantity": getattr(order, "totalQuantity", ""),
+            "limit_price": getattr(order, "lmtPrice", ""),
+            "stop_price": getattr(order, "auxPrice", ""),
+            "oca_group": getattr(order, "ocaGroup", ""),
+            "oca_type": getattr(order, "ocaType", ""),
+            "status": getattr(status, "status", ""),
+            "filled": getattr(status, "filled", ""),
+            "remaining": getattr(status, "remaining", ""),
+            "avg_fill_price": getattr(status, "avgFillPrice", ""),
+            "last_fill_price": getattr(status, "lastFillPrice", ""),
+            "why_held": getattr(status, "whyHeld", ""),
+        }
+
+    def _order_ref_for_ib_id(self, ib_order_id: Any) -> str:
+        if ib_order_id is None:
+            return ""
+        tracked = self.tracked_by_ib_id.get(ib_order_id)
+        return tracked.order_id if tracked is not None else ""
+
+    def _log_broker_event_args(self, csv_name: str, source: str, args: tuple[Any, ...]) -> None:
+        self.logger.csv(
+            csv_name,
+            {
+                "timestamp": datetime.now(timezone.utc),
+                "source": source,
+                "raw_args": [str(arg) for arg in args],
+            },
+        )
