@@ -8,6 +8,26 @@ from pathlib import Path
 from typing import Any
 
 
+CSV_HEADER_SUPERSETS = {
+    "decisions": [
+        "strategy",
+        "symbol",
+        "timestamp",
+        "phase",
+        "passed",
+        "approved",
+        "reason",
+        "mid",
+        "spread",
+        "delta",
+        "absorption_score",
+        "exhaustion_score",
+        "trigger_score",
+        "score",
+    ],
+}
+
+
 class MultiStrategyLogger:
     def __init__(self, root: str | Path = "runs", run_id: str | None = None) -> None:
         run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -25,7 +45,7 @@ class MultiStrategyLogger:
     def csv(self, name: str, row: dict[str, Any]) -> None:
         path = self.run_dir / f"{name}.csv"
         clean = {key: _safe(value) for key, value in row.items()}
-        headers = self._headers.setdefault(name, list(clean.keys()))
+        headers = self._headers.setdefault(name, list(CSV_HEADER_SUPERSETS.get(name, clean.keys())))
         for key in clean:
             if key not in headers:
                 headers.append(key)

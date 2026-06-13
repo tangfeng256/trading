@@ -52,6 +52,22 @@ def test_csv_skips_header_when_file_already_has_content(tmp_path):
     assert lines[-1] == "TSLA,50"
 
 
+def test_decision_csv_uses_stable_header_for_strategy_specific_fields(tmp_path):
+    logger = MultiStrategyLogger(tmp_path)
+
+    logger.csv("decisions", {"strategy": "absorption", "symbol": "NVDA", "passed": False, "reason": "waiting_for_absorption"})
+    logger.csv("decisions", {"strategy": "pullback", "symbol": "NVDA", "approved": True, "reason": "trend_ok", "score": 0.94})
+
+    lines = (logger.run_dir / "decisions.csv").read_text().splitlines()
+    header = lines[0].split(",")
+
+    assert "passed" in header
+    assert "approved" in header
+    assert "score" in header
+    assert len(lines[1].split(",")) == len(header)
+    assert len(lines[2].split(",")) == len(header)
+
+
 def test_safe_serializes_set_deterministically():
     result1 = _safe({"TSLA", "NVDA", "AMD"})
     result2 = _safe({"TSLA", "NVDA", "AMD"})
