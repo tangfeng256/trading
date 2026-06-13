@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .audit import audit_run
+
 
 @dataclass
 class PositionState:
@@ -71,6 +73,7 @@ def replay_run(run_dir: str | Path) -> dict[str, Any]:
 
     _write_csv(run_path / "replay_timeline.csv", timeline)
     summary = _summary(run_path, state, timeline)
+    summary["daily_audit"] = audit_run(run_path, write_outputs=True)
     (run_path / "replay_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary
 
