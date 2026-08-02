@@ -112,7 +112,7 @@ def _add_override_args(parser: argparse.ArgumentParser) -> None:
         action="append",
         default=[],
         metavar="SECTION.FIELD=VALUE",
-        help="Override a config value. Can be repeated, for example --set strategy.symbols=NVDA,AMD.",
+        help="Override a config value. Can be repeated, for example --set strategy.symbols=NVDA,MU.",
     )
 
 

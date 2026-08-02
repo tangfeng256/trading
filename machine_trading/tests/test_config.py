@@ -24,9 +24,16 @@ def test_smart_depth_defaults_to_enabled_for_smart_stock_depth():
     assert config.ib.runner_target_r_multiple == 6.0
     assert config.runtime.trading_timezone == "America/New_York"
     assert config.runtime.trading_start == "09:30:00"
-    assert config.runtime.trading_end == "11:00:00"
+    assert config.runtime.trading_end == "13:00:00"
     assert config.runtime.flatten_before_window_end_seconds == 60
     assert config.runtime.post_window_position_check_seconds == 30
+    assert config.ib.fail_closed_on_depth_permission_error is False
+    assert config.runtime.stop_loss_cooldown_seconds == 600
+    assert config.runtime.auto_stop_after_window_seconds == 120
+    assert config.runtime.quarantine_unmanaged_positions is True
+    assert config.runtime.reconcile_account_positions is True
+    assert config.runtime.startup_position_action == "prompt"
+    assert config.runtime.position_flatten_timeout_seconds == 60
 
 
 def test_load_config_raises_on_unknown_section_key(tmp_path):
@@ -80,3 +87,8 @@ def test_runtime_config_raises_on_invalid_trading_start_format():
 def test_runtime_config_raises_on_invalid_trading_end_format():
     with pytest.raises(ValueError, match="trading_end"):
         RuntimeConfig(trading_end="11:00")
+
+
+def test_runtime_config_rejects_invalid_startup_position_action():
+    with pytest.raises(ValueError, match="startup_position_action"):
+        RuntimeConfig(startup_position_action="ignore")

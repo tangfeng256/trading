@@ -8,7 +8,7 @@ from typing import Any
 
 @dataclass
 class StrategyConfig:
-    symbols: list[str] = field(default_factory=lambda: ["NVDA", "TSLA", "AMD", "META", "AVGO", "MSFT", "QQQ", "TQQQ"])
+    symbols: list[str] = field(default_factory=lambda: ["NVDA", "TSLA", "MU", "META", "AVGO", "MSFT", "QQQ", "TQQQ"])
     market_symbol: str = "QQQ"
     trade_windows: list[list[str]] = field(default_factory=lambda: [["09:35", "11:30"], ["14:00", "15:30"]])
     regular_session_start: str = "09:30"

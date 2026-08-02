@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import sys
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -41,14 +42,18 @@ class MultiStrategyRunner:
         self._forced_flatten_dates: set[str] = set()
         self._last_position_check_at: datetime | None = None
         self._last_depth: dict[str, tuple] = {}
+        self._selected_depth_symbols: list[str] | None = None
         self.state_store = PositionStateStore(config.runtime.log_root)
+        self._input = input
 
     def run(self) -> Path:
         self._connect()
+        shutdown_error: RuntimeError | None = None
         try:
             self._build_adapters()
             if self.broker is not None:
                 now_startup = datetime.now(timezone.utc)
+                self._handle_startup_positions(now_startup)
                 records, cooldowns = self.state_store.load()
                 self.broker.reconcile_on_startup(now_startup, records, cooldowns)
                 self.broker.sync_account_positions(now_startup)
@@ -66,6 +71,9 @@ class MultiStrategyRunner:
                 now = datetime.now(timezone.utc)
                 allow_new_entries = self._allow_new_entries(now)
                 self._force_flatten_if_needed(now)
+                if self._should_auto_stop(now):
+                    self.logger.event("session_stopped", {"reason": "post_window_auto_stop", "time": now.isoformat()})
+                    break
                 for adapter in self.adapters:
                     adapter.poll(now, allow_new_entries=allow_new_entries)
                 if time.monotonic() >= next_heartbeat:
@@ -74,6 +82,9 @@ class MultiStrategyRunner:
                         self.logger.event("stale_entry_order_locks_expired", {"symbols": expired, "time": now.isoformat()})
                         print(f"[{now.replace(microsecond=0).isoformat()}] stale entry order locks cleared: {', '.join(expired)}", flush=True)
                     if self.broker is not None:
+                        if self.config.runtime.reconcile_account_positions:
+                            self.broker.sync_account_positions(now)
+                            self._cover_any_account_shorts(now)
                         self.state_store.save(self.broker)
                     print(self._heartbeat(now), flush=True)
                     next_heartbeat = time.monotonic() + max(1, self.config.ib.heartbeat_seconds)
@@ -81,6 +92,12 @@ class MultiStrategyRunner:
             self.logger.event("session_stopped", {"reason": "keyboard_interrupt"})
         finally:
             if self.broker is not None:
+                try:
+                    self._flatten_on_shutdown()
+                except Exception as exc:
+                    shutdown_error = exc if isinstance(exc, RuntimeError) else RuntimeError(f"Shutdown flatten failed: {exc}")
+                    self.logger.event("shutdown_flatten_failed", {"error": str(shutdown_error), "time": datetime.now(timezone.utc).isoformat()})
+                    print(f"CRITICAL: {shutdown_error}", file=sys.stderr, flush=True)
                 self.state_store.save(self.broker)
             self._disconnect()
             self.logger.finalize(
@@ -90,9 +107,148 @@ class MultiStrategyRunner:
                     "strategies": [adapter.strategy_name for adapter in self.adapters],
                     "locks": self.registry.snapshot(),
                     "dry_run": self.config.runtime.dry_run,
+                    "forced_flatten_reason_counts": self.broker.forced_flatten_reason_counts if self.broker is not None else {},
+                    "unmanaged_positions": self.broker.unmanaged_positions if self.broker is not None else {},
+                    "depth_blocked_symbols": sorted(self.broker.depth_blocked_symbols) if self.broker is not None else [],
                 }
             )
+        if shutdown_error is not None:
+            raise shutdown_error
         return self.logger.run_dir
+
+    def _handle_startup_positions(self, timestamp: datetime) -> None:
+        if self.broker is None:
+            return
+        positions = self.broker.account_position_snapshot()
+        if not positions:
+            return
+        details = ", ".join(
+            f"{row['symbol']} {int(row['quantity']):+d}"
+            for row in positions
+        )
+        has_short = any(int(row["quantity"]) < 0 for row in positions)
+        action = self.config.runtime.startup_position_action
+        if action == "prompt":
+            action = self._prompt_startup_position_action(details, has_short)
+        self.logger.event(
+            "startup_positions_detected",
+            {
+                "positions": [{k: v for k, v in row.items() if k != "contract"} for row in positions],
+                "action": action,
+                "time": timestamp.isoformat(),
+            },
+        )
+        if action == "continue":
+            if has_short:
+                raise RuntimeError(
+                    f"Long-only startup refused with short account inventory: {details}. "
+                    "Choose 'close' to buy it back or 'abort'."
+                )
+            print(f"Continuing with startup positions quarantined: {details}", flush=True)
+            return
+        if action == "abort":
+            raise RuntimeError(f"Startup aborted because account positions exist: {details}")
+        if action != "close":
+            raise RuntimeError(f"Unsupported startup position action: {action}")
+        if self.config.runtime.dry_run:
+            raise RuntimeError(f"Dry-run cannot close startup account positions: {details}")
+        self.broker.cancel_all_working_orders()
+        self.broker.flatten_account_positions(timestamp, "startup_position_close")
+        if not self._wait_for_account_flat("startup_position_close"):
+            raise RuntimeError(f"IB did not confirm startup account positions flat: {details}")
+
+    def _prompt_startup_position_action(self, details: str, has_short: bool) -> str:
+        if not getattr(sys.stdin, "isatty", lambda: False)():
+            raise RuntimeError(
+                f"Account positions found in non-interactive startup: {details}. "
+                "Pass --startup-position-action close|abort"
+                + ("" if has_short else "|continue")
+                + "."
+            )
+        print(f"Existing IB account positions detected: {details}", flush=True)
+        if has_short:
+            prompt = "Long-only safety requires action: [c]lose all positions or [a]bort: "
+            choices = {"c": "close", "close": "close", "a": "abort", "abort": "abort"}
+        else:
+            prompt = "[c]lose all, [a]bort, or [k]eep quarantined: "
+            choices = {
+                "c": "close",
+                "close": "close",
+                "a": "abort",
+                "abort": "abort",
+                "k": "continue",
+                "keep": "continue",
+                "continue": "continue",
+            }
+        while True:
+            choice = self._input(prompt).strip().lower()
+            if choice in choices:
+                return choices[choice]
+            print("Invalid choice.", flush=True)
+
+    def _cover_any_account_shorts(self, timestamp: datetime) -> None:
+        if self.broker is None or self.config.runtime.dry_run:
+            return
+        shorts = [
+            row for row in self.broker.account_position_snapshot()
+            if int(row["quantity"]) < 0
+        ]
+        if not shorts:
+            return
+        self.logger.event(
+            "long_only_account_short_detected",
+            {
+                "positions": [{k: v for k, v in row.items() if k != "contract"} for row in shorts],
+                "time": timestamp.isoformat(),
+            },
+        )
+        self.broker.flatten_account_positions(timestamp, "long_only_account_short", shorts_only=True)
+
+    def _flatten_on_shutdown(self) -> None:
+        if self.broker is None:
+            return
+        if not self.ib or not self.ib.isConnected():
+            raise RuntimeError("Cannot verify or flatten the IB account because the broker is disconnected")
+        positions = self.broker.account_position_snapshot()
+        if not positions:
+            self.logger.event("shutdown_account_flat_confirmed", {"time": datetime.now(timezone.utc).isoformat()})
+            return
+        details = ", ".join(f"{row['symbol']} {int(row['quantity']):+d}" for row in positions)
+        if self.config.runtime.dry_run:
+            raise RuntimeError(f"Dry-run shutdown left account positions unchanged: {details}")
+        timestamp = datetime.now(timezone.utc)
+        self.logger.event("shutdown_flatten_started", {"positions": details, "time": timestamp.isoformat()})
+        self.broker.cancel_all_working_orders()
+        self.broker.flatten_account_positions(timestamp, "tool_exit")
+        if not self._wait_for_account_flat("tool_exit"):
+            remaining = self.broker.account_position_snapshot()
+            unresolved = ", ".join(f"{row['symbol']} {int(row['quantity']):+d}" for row in remaining)
+            raise RuntimeError(f"IB did not confirm account flat before shutdown: {unresolved or details}")
+        self.logger.event("shutdown_account_flat_confirmed", {"time": datetime.now(timezone.utc).isoformat()})
+
+    def _wait_for_account_flat(self, reason: str) -> bool:
+        if self.broker is None:
+            return True
+        timeout = max(1, self.config.runtime.position_flatten_timeout_seconds)
+        deadline = time.monotonic() + timeout
+        next_retry = time.monotonic() + 2.0
+        while True:
+            positions = self.broker.account_position_snapshot()
+            has_working_orders = getattr(self.broker, "has_working_orders", lambda: False)()
+            if not positions and not has_working_orders:
+                clear_state = getattr(self.broker, "clear_local_state_after_account_flat", None)
+                if clear_state is not None:
+                    clear_state()
+                return True
+            now_monotonic = time.monotonic()
+            if now_monotonic >= deadline:
+                return False
+            if now_monotonic >= next_retry:
+                self.broker.flatten_account_positions(datetime.now(timezone.utc), reason)
+                next_retry = now_monotonic + 2.0
+            if not self.ib or not self.ib.isConnected():
+                return False
+            self.ib.waitOnUpdate(timeout=min(0.5, max(0.0, deadline - now_monotonic)))
 
     def _bind_adapters_to_restored_positions(self) -> None:
         """After reconcile_on_startup, let each adapter claim any position it owns
@@ -115,7 +271,11 @@ class MultiStrategyRunner:
         try:
             from ib_insync import IB, Stock
         except ImportError as exc:
-            raise RuntimeError("ib_insync is required for multi-strategy paper/live trading") from exc
+            raise RuntimeError(
+                "ib_insync is required for multi-strategy paper/live trading. "
+                f"Python executable: {sys.executable}. "
+                "Install it with: python -m pip install ib_insync"
+            ) from exc
         if self.mode == "live" and not self.config.runtime.live_trading_enabled:
             raise RuntimeError("Refusing live orders: runtime.live_trading_enabled is false")
         self.ib = IB()
@@ -143,6 +303,8 @@ class MultiStrategyRunner:
 
     def _build_adapters(self) -> None:
         assert self.ib is not None
+        depth_strategy_symbols = self._depth_strategy_symbols()
+        pullback_symbols = self._pullback_strategy_symbols(depth_strategy_symbols)
         self.broker = SharedBroker(
             self.ib,
             self.contracts,
@@ -156,12 +318,16 @@ class MultiStrategyRunner:
             runner_target_enabled=self.config.ib.runner_target_enabled,
             runner_target_r_multiple=self.config.ib.runner_target_r_multiple,
             forced_flatten_cooldown_seconds=self.config.runtime.forced_flatten_cooldown_seconds,
+            stop_loss_cooldown_seconds=self.config.runtime.stop_loss_cooldown_seconds,
             manage_account_positions=self.config.runtime.manage_account_positions,
+            quarantine_unmanaged_positions=self.config.runtime.quarantine_unmanaged_positions,
+            fail_closed_on_depth_permission_error=self.config.ib.fail_closed_on_depth_permission_error,
+            depth_required_strategies={"absorption"} | ({"pullback"} if self._pullback_uses_l2() else set()),
         )
         factories = {
             "opening_range": lambda: OpeningRangeAdapter(self.config.strategy_files.opening_range, self.config.runtime.symbols, self.broker, self.registry, self.logger),
-            "pullback": lambda: PullbackAdapter(self.config.strategy_files.pullback, self.config.runtime.symbols, self.broker, self.registry, self.logger),
-            "absorption": lambda: AbsorptionAdapter(self.config.strategy_files.absorption, self.config.runtime.symbols, self.broker, self.registry, self.logger),
+            "pullback": lambda: PullbackAdapter(self.config.strategy_files.pullback, pullback_symbols, self.broker, self.registry, self.logger),
+            "absorption": lambda: AbsorptionAdapter(self.config.strategy_files.absorption, depth_strategy_symbols, self.broker, self.registry, self.logger),
         }
         enabled = set(self.config.runtime.enabled_strategies)
         self.adapters = [factories[name]() for name in self.config.runtime.strategy_priority if name in enabled]
@@ -179,6 +345,9 @@ class MultiStrategyRunner:
             self.depth_tickers[symbol] = depth
 
     def _depth_symbols(self) -> list[str]:
+        cached = getattr(self, "_selected_depth_symbols", None)
+        if cached is not None:
+            return list(cached)
         max_depth_requests = max(0, self.config.ib.max_depth_requests)
         requested = self.config.ib.depth_symbols or list(self.contracts)
         available = [symbol for symbol in requested if symbol in self.contracts]
@@ -192,7 +361,24 @@ class MultiStrategyRunner:
             print(message, flush=True)
             if hasattr(self, "logger"):
                 self.logger.event("depth_subscription_limit", {"selected": selected, "l1_only": skipped, "max_depth_requests": max_depth_requests})
-        return selected
+        self._selected_depth_symbols = list(selected)
+        return list(selected)
+
+    def _depth_strategy_symbols(self) -> list[str]:
+        selected = set(self._depth_symbols())
+        return [symbol for symbol in self.config.runtime.symbols if symbol in selected]
+
+    def _pullback_strategy_symbols(self, depth_strategy_symbols: list[str] | None = None) -> list[str]:
+        """Use the full runtime universe when pullback is configured for L1."""
+        if not self._pullback_uses_l2():
+            return list(self.config.runtime.symbols)
+        return list(depth_strategy_symbols if depth_strategy_symbols is not None else self._depth_strategy_symbols())
+
+    def _pullback_uses_l2(self) -> bool:
+        from pullback_trend.config import load_config as load_pullback_config
+
+        pullback = load_pullback_config(self.config.strategy_files.pullback)
+        return bool(pullback.strategy.use_l2)
 
     def _subscribe_bars(self) -> None:
         for symbol, contract in self.contracts.items():
@@ -226,6 +412,7 @@ class MultiStrategyRunner:
                 midpoint = (bid + ask) / 2
                 self.broker.update_trailing_stops(symbol, midpoint, now)
                 self.broker.enforce_stop_breaches(symbol, midpoint, now)
+                self.broker.resubmit_unacknowledged_exits(now)
 
         bids = _book_levels(getattr(ticker, "domBids", None), reverse=True, limit=self.config.ib.depth_rows)
         asks = _book_levels(getattr(ticker, "domAsks", None), reverse=False, limit=self.config.ib.depth_rows)
@@ -276,7 +463,12 @@ class MultiStrategyRunner:
         else:
             mode = "passed trading window"
         symbols = ", ".join(sorted(self.contracts)) or "none"
-        return f"[{now.replace(microsecond=0).isoformat()}] heartbeat: monitoring {len(self.contracts)} stocks ({symbols}); status={mode}; locks={locks}"
+        flattens = ""
+        reason_counts = getattr(getattr(self, "broker", None), "forced_flatten_reason_counts", None)
+        if reason_counts:
+            counts = ", ".join(f"{reason}:{count}" for reason, count in sorted(reason_counts.items()))
+            flattens = f"; forced_flattens=[{counts}]"
+        return f"[{now.replace(microsecond=0).isoformat()}] heartbeat: monitoring {len(self.contracts)} stocks ({symbols}); status={mode}; locks={locks}{flattens}"
 
     def _is_trading_window(self, timestamp: datetime) -> bool:
         if timestamp.tzinfo is None:
@@ -297,6 +489,15 @@ class MultiStrategyRunner:
     def _should_force_flatten(self, timestamp: datetime) -> bool:
         local = self._local_time(timestamp)
         return local >= self._closeout_start(local)
+
+    def _should_auto_stop(self, timestamp: datetime) -> bool:
+        if self.broker is None or self.broker.has_open_positions():
+            return False
+        local = self._local_time(timestamp)
+        end = _parse_clock(self.config.runtime.trading_end)
+        window_end = local.replace(hour=end.hour, minute=end.minute, second=end.second, microsecond=0)
+        stop_at = window_end + timedelta(seconds=max(0, self.config.runtime.auto_stop_after_window_seconds))
+        return local >= stop_at
 
     def _force_flatten_if_needed(self, timestamp: datetime) -> None:
         if self.broker is None or not self._should_force_flatten(timestamp):

@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, get_args, get_origin
 @dataclass
 class StrategyConfig:
     symbols: List[str] = field(
-        default_factory=lambda: ["NVDA", "TSLA", "AMD", "AAPL", "MSFT", "META", "QQQ", "TQQQ"]
+        default_factory=lambda: ["NVDA", "TSLA", "MU", "AAPL", "MSFT", "META", "QQQ", "TQQQ"]
     )
     or_start: str = "09:30"
     or_end: str = "09:45"

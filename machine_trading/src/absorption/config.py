@@ -60,6 +60,7 @@ class ExecutionConfig:
     tp1_fraction: float = 0.5
     tp2_r_multiple: float = 2.0
     move_stop_to_breakeven_after_tp1: bool = True
+    protective_order_delay_seconds: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -73,7 +74,7 @@ class LoggingConfig:
 @dataclass(frozen=True)
 class AppConfig:
     ib: IBConfig = field(default_factory=IBConfig)
-    symbols: list[str] = field(default_factory=lambda: ["NVDA", "TSLA", "AMD", "TQQQ"])
+    symbols: list[str] = field(default_factory=lambda: ["NVDA", "TSLA", "MU", "TQQQ"])
     market: MarketConfig = field(default_factory=MarketConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)

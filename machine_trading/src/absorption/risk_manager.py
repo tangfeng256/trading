@@ -62,9 +62,17 @@ class RiskManager:
         self.active_symbols.add(symbol)
         self.trades_by_day[timestamp.date()] = self.trades_by_day.get(timestamp.date(), 0) + 1
 
-    def mark_trade_closed(self, symbol: str, timestamp: datetime, realized_pnl: float) -> None:
+    def mark_trade_closed(self, symbol: str, timestamp: datetime, realized_pnl: float, *, filled: bool = True) -> None:
         self.active_symbols.discard(symbol)
-        self.realized_pnl_by_day[timestamp.date()] = self.realized_pnl_by_day.get(timestamp.date(), 0.0) + realized_pnl
+        self.record_realized_pnl(timestamp, realized_pnl)
+        if not filled:
+            today = timestamp.date()
+            if self.trades_by_day.get(today, 0) > 0:
+                self.trades_by_day[today] -= 1
+
+    def record_realized_pnl(self, timestamp: datetime, amount: float) -> None:
+        today = timestamp.date()
+        self.realized_pnl_by_day[today] = self.realized_pnl_by_day.get(today, 0.0) + amount
 
     def emergency_kill(self) -> None:
         self.kill_switch = True
