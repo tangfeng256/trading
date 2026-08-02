@@ -19,6 +19,7 @@
         {
             "name": "▶  Orchestrator — Paper",
             "type": "python",
+            "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
             "request": "launch",
             "program": "${workspaceFolder}/run.py",
             "args": [
@@ -35,6 +36,7 @@
         {
             "name": "▶  Orchestrator — Paper (dry-run, signals only)",
             "type": "python",
+            "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
             "request": "launch",
             "program": "${workspaceFolder}/run.py",
             "args": [
@@ -52,6 +54,7 @@
         {
             "name": "⚡ Orchestrator — LIVE  ⚠ real orders",
             "type": "python",
+            "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
             "request": "launch",
             "program": "${workspaceFolder}/run.py",
             "args": [
@@ -68,6 +71,7 @@
         {
             "name": "🔍 Orchestrator — Debug Paper",
             "type": "python",
+            "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
             "request": "launch",
             "program": "${workspaceFolder}/run.py",
             "args": [
@@ -89,6 +93,7 @@
         {
             "name": "▶  Absorption — Paper",
             "type": "python",
+            "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
             "request": "launch",
             "program": "${workspaceFolder}/run.py",
             "args": [
@@ -105,6 +110,7 @@
         {
             "name": "▶  Absorption — Paper (dry-run, signals only)",
             "type": "python",
+            "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
             "request": "launch",
             "program": "${workspaceFolder}/run.py",
             "args": [
@@ -122,6 +128,7 @@
         {
             "name": "⚡ Absorption — LIVE  ⚠ real orders",
             "type": "python",
+            "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
             "request": "launch",
             "program": "${workspaceFolder}/run.py",
             "args": [
@@ -138,6 +145,7 @@
         {
             "name": "🔍 Absorption — Debug Paper",
             "type": "python",
+            "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
             "request": "launch",
             "program": "${workspaceFolder}/run.py",
             "args": [
@@ -159,6 +167,7 @@
         {
             "name": "▶  Pullback — Paper",
             "type": "python",
+            "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
             "request": "launch",
             "program": "${workspaceFolder}/run.py",
             "args": [
@@ -175,6 +184,7 @@
         {
             "name": "▶  Pullback — Paper (dry-run, signals only)",
             "type": "python",
+            "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
             "request": "launch",
             "program": "${workspaceFolder}/run.py",
             "args": [
@@ -192,6 +202,7 @@
         {
             "name": "⚡ Pullback — LIVE  ⚠ real orders",
             "type": "python",
+            "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
             "request": "launch",
             "program": "${workspaceFolder}/run.py",
             "args": [
@@ -208,6 +219,7 @@
         {
             "name": "🔍 Pullback — Debug Paper",
             "type": "python",
+            "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
             "request": "launch",
             "program": "${workspaceFolder}/run.py",
             "args": [
@@ -229,6 +241,7 @@
         {
             "name": "▶  Opening Range — Paper",
             "type": "python",
+            "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
             "request": "launch",
             "program": "${workspaceFolder}/run.py",
             "args": [
@@ -245,6 +258,7 @@
         {
             "name": "▶  Opening Range — Paper (dry-run, signals only)",
             "type": "python",
+            "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
             "request": "launch",
             "program": "${workspaceFolder}/run.py",
             "args": [
@@ -262,6 +276,7 @@
         {
             "name": "⚡ Opening Range — LIVE  ⚠ real orders",
             "type": "python",
+            "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
             "request": "launch",
             "program": "${workspaceFolder}/run.py",
             "args": [
@@ -278,6 +293,7 @@
         {
             "name": "🔍 Opening Range — Debug Paper",
             "type": "python",
+            "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
             "request": "launch",
             "program": "${workspaceFolder}/run.py",
             "args": [

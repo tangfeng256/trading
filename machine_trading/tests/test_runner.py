@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 
 from multi_strategy.config import AppConfig
@@ -69,6 +69,9 @@ class _Execution:
     def flatten_expired_positions(self, now):
         return [_Order("flatten-2")]
 
+    def _trade_for_order(self, order_id):
+        return None
+
 
 class _Broker:
     def __init__(self):
@@ -111,6 +114,26 @@ class _BrokerWithFlatten:
 
     def sync_account_positions(self, timestamp):
         self.syncs.append(timestamp)
+
+
+class _LifecycleBroker:
+    def __init__(self, positions):
+        self.positions = list(positions)
+        self.cancelled_all = 0
+        self.flatten_calls = []
+
+    def account_position_snapshot(self):
+        return list(self.positions)
+
+    def cancel_all_working_orders(self):
+        self.cancelled_all += 1
+
+    def flatten_account_positions(self, timestamp, reason, shorts_only=False):
+        self.flatten_calls.append((timestamp, reason, shorts_only))
+        return len([
+            row for row in self.positions
+            if not shorts_only or row["quantity"] < 0
+        ])
 
 
 class _Level:
@@ -192,20 +215,20 @@ def test_heartbeat_reports_passed_trading_window_after_end():
     runner.registry = PositionRegistry(config.runtime.lock_on_entry_order)
     runner.contracts = {"NVDA": object()}
 
-    message = runner._heartbeat(datetime(2026, 6, 2, 15, 12, tzinfo=timezone.utc))
+    message = runner._heartbeat(datetime(2026, 6, 2, 17, 12, tzinfo=timezone.utc))
 
     assert "status=passed trading window" in message
 
 
-def test_trading_window_is_930_to_1100_eastern():
+def test_trading_window_is_930_to_1300_eastern():
     config = AppConfig()
     runner = MultiStrategyRunner.__new__(MultiStrategyRunner)
     runner.config = config
 
     assert runner._is_trading_window(datetime(2026, 6, 2, 13, 29, 59, tzinfo=timezone.utc)) is False
     assert runner._is_trading_window(datetime(2026, 6, 2, 13, 30, tzinfo=timezone.utc)) is True
-    assert runner._is_trading_window(datetime(2026, 6, 2, 14, 59, 59, tzinfo=timezone.utc)) is True
-    assert runner._is_trading_window(datetime(2026, 6, 2, 15, 0, tzinfo=timezone.utc)) is False
+    assert runner._is_trading_window(datetime(2026, 6, 2, 16, 59, 59, tzinfo=timezone.utc)) is True
+    assert runner._is_trading_window(datetime(2026, 6, 2, 17, 0, tzinfo=timezone.utc)) is False
 
 
 def test_entries_stop_during_closeout_minute_before_window_end():
@@ -213,8 +236,22 @@ def test_entries_stop_during_closeout_minute_before_window_end():
     runner = MultiStrategyRunner.__new__(MultiStrategyRunner)
     runner.config = config
 
-    assert runner._allow_new_entries(datetime(2026, 6, 2, 14, 58, 59, tzinfo=timezone.utc)) is True
-    assert runner._allow_new_entries(datetime(2026, 6, 2, 14, 59, tzinfo=timezone.utc)) is False
+    assert runner._allow_new_entries(datetime(2026, 6, 2, 16, 58, 59, tzinfo=timezone.utc)) is True
+    assert runner._allow_new_entries(datetime(2026, 6, 2, 16, 59, tzinfo=timezone.utc)) is False
+
+
+def test_runner_auto_stops_after_grace_period_only_when_managed_positions_are_flat():
+    config = AppConfig()
+    runner = MultiStrategyRunner.__new__(MultiStrategyRunner)
+    runner.config = config
+    runner.broker = _BrokerWithFlatten()
+    runner.broker.open_positions = False
+
+    assert runner._should_auto_stop(datetime(2026, 6, 2, 17, 1, 59, tzinfo=timezone.utc)) is False
+    assert runner._should_auto_stop(datetime(2026, 6, 2, 17, 2, tzinfo=timezone.utc)) is True
+
+    runner.broker.open_positions = True
+    assert runner._should_auto_stop(datetime(2026, 6, 2, 17, 3, tzinfo=timezone.utc)) is False
 
 
 def test_runner_forces_flatten_once_before_window_end():
@@ -225,7 +262,7 @@ def test_runner_forces_flatten_once_before_window_end():
     runner.logger = _Logger()
     runner._forced_flatten_dates = set()
     runner._last_position_check_at = None
-    timestamp = datetime(2026, 6, 2, 14, 59, tzinfo=timezone.utc)
+    timestamp = datetime(2026, 6, 2, 16, 59, tzinfo=timezone.utc)
 
     runner._force_flatten_if_needed(timestamp)
     runner._force_flatten_if_needed(timestamp)
@@ -242,8 +279,8 @@ def test_runner_keeps_checking_positions_after_window_end():
     runner.logger = _Logger()
     runner._forced_flatten_dates = set()
     runner._last_position_check_at = None
-    first = datetime(2026, 6, 2, 15, 0, tzinfo=timezone.utc)
-    second = datetime(2026, 6, 2, 15, 0, 30, tzinfo=timezone.utc)
+    first = datetime(2026, 6, 2, 17, 0, tzinfo=timezone.utc)
+    second = datetime(2026, 6, 2, 17, 0, 30, tzinfo=timezone.utc)
 
     runner._force_flatten_if_needed(first)
     runner._force_flatten_if_needed(second)
@@ -268,6 +305,56 @@ def test_runner_skips_post_window_check_when_no_positions_are_open():
     assert runner.logger.events == []
 
 
+def test_startup_close_flattens_existing_account_positions_before_trading():
+    config = AppConfig()
+    config.runtime.startup_position_action = "close"
+    runner = MultiStrategyRunner.__new__(MultiStrategyRunner)
+    runner.config = config
+    runner.broker = _LifecycleBroker([{"symbol": "NVDA", "quantity": -20, "avg_price": 200.55}])
+    runner.logger = _Logger()
+    runner._wait_for_account_flat = lambda reason: reason == "startup_position_close"
+    timestamp = datetime(2026, 7, 23, 13, 29, tzinfo=timezone.utc)
+
+    runner._handle_startup_positions(timestamp)
+
+    assert runner.broker.cancelled_all == 1
+    assert runner.broker.flatten_calls == [(timestamp, "startup_position_close", False)]
+    assert runner.logger.events[-1][0] == "startup_positions_detected"
+
+
+def test_long_only_startup_never_allows_continue_with_a_short_position():
+    config = AppConfig()
+    config.runtime.startup_position_action = "continue"
+    runner = MultiStrategyRunner.__new__(MultiStrategyRunner)
+    runner.config = config
+    runner.broker = _LifecycleBroker([{"symbol": "NVDA", "quantity": -20, "avg_price": 200.55}])
+    runner.logger = _Logger()
+
+    try:
+        runner._handle_startup_positions(datetime(2026, 7, 23, 13, 29, tzinfo=timezone.utc))
+    except RuntimeError as exc:
+        assert "Long-only startup refused" in str(exc)
+    else:
+        raise AssertionError("short inventory must not be allowed to continue")
+
+
+def test_shutdown_flattens_and_confirms_the_authoritative_account_inventory():
+    config = AppConfig()
+    runner = MultiStrategyRunner.__new__(MultiStrategyRunner)
+    runner.config = config
+    runner.broker = _LifecycleBroker([{"symbol": "TSLA", "quantity": 12, "avg_price": 320.0}])
+    runner.logger = _Logger()
+    runner.ib = type("IB", (), {"isConnected": lambda self: True})()
+    runner._wait_for_account_flat = lambda reason: reason == "tool_exit"
+
+    runner._flatten_on_shutdown()
+
+    assert runner.broker.cancelled_all == 1
+    assert len(runner.broker.flatten_calls) == 1
+    assert runner.broker.flatten_calls[0][1:] == ("tool_exit", False)
+    assert runner.logger.events[-1][0] == "shutdown_account_flat_confirmed"
+
+
 def test_completed_bars_pass_trading_window_flag_to_adapters():
     config = AppConfig()
     runner = MultiStrategyRunner.__new__(MultiStrategyRunner)
@@ -275,7 +362,7 @@ def test_completed_bars_pass_trading_window_flag_to_adapters():
     adapter = _Adapter()
     runner.adapters = [adapter]
 
-    runner._on_completed_bar("NVDA", _Bar(datetime(2026, 6, 2, 15, 0, tzinfo=timezone.utc)))
+    runner._on_completed_bar("NVDA", _Bar(datetime(2026, 6, 2, 17, 0, tzinfo=timezone.utc)))
 
     assert adapter.bars == [("NVDA", False)]
 
@@ -351,6 +438,46 @@ def test_subscribe_market_data_limits_depth_requests_to_configured_symbols():
     assert list(runner.depth_tickers) == ["TQQQ", "TSLA"]
 
 
+def test_l2_dependent_strategies_only_receive_depth_subscribed_symbols():
+    config = AppConfig()
+    config.runtime.symbols = ["NVDA", "TSLA", "MU", "TQQQ"]
+    config.ib.depth_symbols = ["NVDA", "TSLA", "MU"]
+    config.ib.max_depth_requests = 3
+    runner = MultiStrategyRunner.__new__(MultiStrategyRunner)
+    runner.config = config
+    runner.contracts = {symbol: object() for symbol in config.runtime.symbols}
+    runner.logger = _Logger()
+
+    assert runner._depth_strategy_symbols() == ["NVDA", "TSLA", "MU"]
+    assert runner._depth_symbols() == ["NVDA", "TSLA", "MU"]
+
+
+def test_pullback_l1_mode_receives_full_runtime_universe(tmp_path):
+    config = AppConfig()
+    config.runtime.symbols = ["NVDA", "TSLA", "MU", "TQQQ"]
+    pullback_config = tmp_path / "pullback.json"
+    pullback_config.write_text('{"strategy": {"use_l2": false}}', encoding="utf-8")
+    config.strategy_files.pullback = str(pullback_config)
+    runner = MultiStrategyRunner.__new__(MultiStrategyRunner)
+    runner.config = config
+
+    assert runner._pullback_uses_l2() is False
+    assert runner._pullback_strategy_symbols(["NVDA", "TSLA", "MU"]) == ["NVDA", "TSLA", "MU", "TQQQ"]
+
+
+def test_pullback_l2_mode_remains_limited_to_depth_universe(tmp_path):
+    config = AppConfig()
+    config.runtime.symbols = ["NVDA", "TSLA", "MU", "TQQQ"]
+    pullback_config = tmp_path / "pullback.json"
+    pullback_config.write_text('{"strategy": {"use_l2": true}}', encoding="utf-8")
+    config.strategy_files.pullback = str(pullback_config)
+    runner = MultiStrategyRunner.__new__(MultiStrategyRunner)
+    runner.config = config
+
+    assert runner._pullback_uses_l2() is True
+    assert runner._pullback_strategy_symbols(["NVDA", "TSLA", "MU"]) == ["NVDA", "TSLA", "MU"]
+
+
 def test_configured_symbols_preserves_runtime_priority_before_strategy_markets():
     config = AppConfig()
     config.runtime.symbols = ["TSLA", "TQQQ", "NVDA", "TSLA"]
@@ -399,9 +526,9 @@ def test_absorption_exit_plan_uses_wider_stop_and_larger_targets():
     expected_distance = 211.93 * 0.0025
 
     assert risk >= round(211.93 * 0.0025, 4)
-    assert adjusted.stop_price == 211.4002
-    assert adjusted.target1_price == round(211.93 + expected_distance * 1.5, 4)
-    assert adjusted.target2_price == round(211.93 + expected_distance * 3.0, 4)
+    assert adjusted.stop_price == 211.40
+    assert adjusted.target1_price == 212.73
+    assert adjusted.target2_price == 213.52
     assert adapter.logger.events[-1][0] == "absorption_exit_plan_adjusted"
 
 
@@ -482,6 +609,58 @@ def test_absorption_on_broker_fill_ignores_unknown_order_id():
     adapter.on_broker_fill("ghost-order", datetime(2026, 6, 2, 14, 0, tzinfo=timezone.utc), 100, 200.0)
 
 
+def test_absorption_protective_orders_are_delayed_after_entry_fill():
+    # IB's paper account doesn't register an entry fill's position update
+    # instantly; submitting the tp1/tp2/stop SELL orders in the same instant
+    # gets them silently stuck or cancelled. Protective orders must be queued
+    # and only sent to the broker once the configured delay has elapsed.
+    timestamp = datetime(2026, 6, 11, 13, 30, tzinfo=timezone.utc)
+    signal = AbsorptionSignal(
+        symbol="NVDA",
+        timestamp=timestamp,
+        phase="long",
+        entry_ref_price=202.49,
+        absorption_level=202.40,
+        stop_price=201.97,
+        target1_price=203.23,
+        target2_price=203.99,
+        confidence=0.8,
+        reason_codes=[],
+        feature_snapshot={"spread_bps": 1.0},
+    )
+    execution_config = AbsExecutionConfig(protective_order_delay_seconds=2.0)
+    adapter = AbsorptionAdapter.__new__(AbsorptionAdapter)
+    adapter.execution = AbsExecutionManager(execution_config, AbsMarketConfig(), AbsStrategyConfig())
+    adapter.risk = AbsRiskManager(AbsRiskConfig(), AbsStrategyConfig())
+    adapter.registry = PositionRegistry()
+    adapter.broker = _Broker()
+    adapter.logger = _Logger()
+    adapter.strategy_name = "absorption"
+    adapter.config = type("Config", (), {"execution": execution_config})()
+
+    trade = adapter.execution.submit_entry(signal, 123)
+    adapter.risk.mark_trade_opened("NVDA", timestamp)
+
+    adapter.on_broker_fill(trade.entry_order_id, timestamp, 100, 202.39)
+    adapter.on_broker_fill(trade.entry_order_id, timestamp + timedelta(milliseconds=100), 23, 202.39)
+
+    # tp1/tp2/stop were created locally but must not be sent to the broker yet.
+    assert adapter.broker.submitted == []
+    assert len(adapter._pending_protective_orders) == 3
+
+    # Still within the delay window: nothing submitted.
+    adapter.poll(timestamp + timedelta(seconds=1), allow_new_entries=False)
+    assert adapter.broker.submitted == []
+
+    # Delay has elapsed: the queued protective orders go out now.
+    adapter.poll(timestamp + timedelta(seconds=2), allow_new_entries=False)
+    assert len(adapter.broker.submitted) == 3
+    submitted = {adapter.execution.orders[order_id].role: adapter.execution.orders[order_id] for order_id in adapter.broker.submitted}
+    assert submitted["stop"].qty == 123
+    assert submitted["tp1"].qty + submitted["tp2"].qty == 123
+    assert adapter._pending_protective_orders == []
+
+
 def test_absorption_forced_flatten_fill_clears_risk_state():
     timestamp = datetime(2026, 6, 11, 13, 30, tzinfo=timezone.utc)
     signal = AbsorptionSignal(
@@ -518,6 +697,43 @@ def test_absorption_forced_flatten_fill_clears_risk_state():
     assert adapter.registry.owner("NVDA") is None
     assert trade.status == AbsTradeStatus.CLOSED
     assert trade.realized_pnl < 0
+
+
+def test_absorption_exit_pnl_and_commission_feed_daily_loss_gate():
+    timestamp = datetime(2026, 6, 11, 13, 30, tzinfo=timezone.utc)
+    signal = AbsorptionSignal(
+        symbol="NVDA",
+        timestamp=timestamp,
+        phase="long",
+        entry_ref_price=100.0,
+        absorption_level=99.9,
+        stop_price=99.0,
+        target1_price=101.0,
+        target2_price=102.0,
+        confidence=0.8,
+        reason_codes=[],
+        feature_snapshot={"spread_bps": 1.0},
+    )
+    adapter = AbsorptionAdapter.__new__(AbsorptionAdapter)
+    adapter.execution = AbsExecutionManager(AbsExecutionConfig(tp1_fraction=0.5), AbsMarketConfig(), AbsStrategyConfig())
+    adapter.risk = AbsRiskManager(AbsRiskConfig(account_equity=10_000, max_daily_loss_pct=0.01), AbsStrategyConfig())
+    adapter.registry = PositionRegistry()
+    adapter.broker = _Broker()
+    adapter.logger = _Logger()
+    adapter.strategy_name = "absorption"
+    adapter.config = type("Config", (), {"execution": AbsExecutionConfig(protective_order_delay_seconds=0)})()
+    trade = adapter.execution.submit_entry(signal, 100)
+    adapter.risk.mark_trade_opened("NVDA", timestamp)
+
+    adapter.on_broker_fill(trade.entry_order_id, timestamp, 100, 100.0)
+    stop = next(order for order in trade.orders.values() if order.role == "stop")
+    adapter.on_broker_fill(stop.order_id, timestamp + timedelta(seconds=5), 100, 99.0)
+    adapter.on_broker_commission(timestamp + timedelta(seconds=5), 2.0)
+
+    assert adapter.risk.realized_pnl_by_day[timestamp.date()] == -102.0
+    decision = adapter.risk.approve(signal)
+    assert not decision.approved
+    assert decision.reason == "daily_loss_exceeded"
 
 
 def test_pullback_on_broker_fill_ignores_unknown_order_id():
@@ -645,3 +861,17 @@ def test_orm_on_broker_fill_unlocks_when_position_closed():
     adapter.on_broker_fill("exit-1", datetime(2026, 6, 2, 14, 30, tzinfo=timezone.utc), 100, 215.0)
 
     assert registry.owner("NVDA") is None
+
+
+def test_stale_entry_cancellation_does_not_count_toward_max_trades():
+    ts = datetime(2026, 6, 17, 13, 45, tzinfo=timezone.utc)
+    risk = AbsRiskManager(AbsRiskConfig(max_trades_per_day=3), AbsStrategyConfig())
+
+    risk.mark_trade_opened("NVDA", ts)   # filled trade → count = 1
+    risk.mark_trade_opened("TSLA", ts)   # stale attempt 1 → count = 2
+    risk.mark_trade_closed("TSLA", ts, 0.0, filled=False)   # cancelled, no fill → count = 1
+    risk.mark_trade_opened("TSLA", ts)   # stale attempt 2 → count = 2
+    risk.mark_trade_closed("TSLA", ts, 0.0, filled=False)   # cancelled, no fill → count = 1
+
+    assert risk.trades_by_day[ts.date()] == 1
+    assert "TSLA" not in risk.active_symbols

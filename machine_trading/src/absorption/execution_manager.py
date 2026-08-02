@@ -6,6 +6,7 @@ from itertools import count
 from .config import ExecutionConfig, MarketConfig, StrategyConfig
 from .logger import RunLogger
 from .order_state import ManagedOrder, ManagedTrade, OrderStatus, Signal, TradeStatus
+from .pricing import round_to_tick
 
 
 class ExecutionManager:
@@ -40,7 +41,11 @@ class ExecutionManager:
             raise RuntimeError("emergency kill switch enabled")
         entry_order_id = self._next_id("entry")
         trade_id = self._next_id("trade")
-        limit_price = round(signal.entry_ref_price + self.execution.entry_price_offset_ticks * self.market.tick_size, 4)
+        limit_price = round_to_tick(
+            signal.entry_ref_price + self.execution.entry_price_offset_ticks * self.market.tick_size,
+            self.market.tick_size,
+            "up",
+        )
         order = ManagedOrder(
             order_id=entry_order_id,
             symbol=signal.symbol,
@@ -89,12 +94,17 @@ class ExecutionManager:
             trade.filled_qty = order.filled_qty
             trade.status = TradeStatus.OPEN
             created = self.ensure_protection(trade.trade_id, timestamp)
-        elif order.role == "tp1":
-            trade.tp1_filled = True
-            if self.execution.move_stop_to_breakeven_after_tp1:
-                self.tighten_stop_to_breakeven(trade.trade_id)
-        elif order.role in {"tp2", "stop"}:
-            trade.status = TradeStatus.CLOSED
+        elif order.side == "SELL":
+            entry_order = self.orders.get(trade.entry_order_id)
+            entry_price = float(getattr(entry_order, "avg_fill_price", 0.0) or trade.entry_price)
+            trade.realized_pnl += (fill_price - entry_price) * fill_qty
+            if order.role == "tp1" and order.remaining_qty == 0:
+                trade.tp1_filled = True
+                if self.execution.move_stop_to_breakeven_after_tp1:
+                    self.tighten_stop_to_breakeven(trade.trade_id)
+            sold_qty = sum(exit_order.filled_qty for exit_order in trade.orders.values() if exit_order.side == "SELL")
+            if sold_qty >= trade.filled_qty:
+                trade.status = TradeStatus.CLOSED
         return created
 
     def ensure_protection(self, trade_id: str, timestamp: datetime) -> list[ManagedOrder]:
@@ -106,14 +116,26 @@ class ExecutionManager:
         if trade.stop_created or trade.tp1_created or trade.tp2_created:
             if trade.protection_qty == trade.filled_qty:
                 return []
-            # Existing protection is intentionally not duplicated. A real broker
-            # adapter should amend quantities; the paper state records this need.
+            # Entry fills can arrive in several executions during the protective-
+            # order delay. Resize the queued order objects in place so the broker
+            # receives protection for the final filled quantity, not just the first
+            # execution fragment.
+            tp1_qty, tp2_qty = self._protection_split(trade.filled_qty)
+            existing = {order.role: order for order in trade.orders.values() if order.side == "SELL"}
+            if "tp1" in existing and existing["tp1"].filled_qty == 0:
+                existing["tp1"].qty = tp1_qty
+            if "tp2" in existing and existing["tp2"].filled_qty == 0:
+                existing["tp2"].qty = tp2_qty
+            if "stop" in existing and existing["stop"].filled_qty == 0:
+                existing["stop"].qty = trade.filled_qty
+            created: list[ManagedOrder] = []
+            if tp2_qty > 0 and "tp2" not in existing:
+                created.append(self._create_exit(trade, "tp2", "SELL", tp2_qty, "LMT", timestamp, price=trade.target2_price))
+                trade.tp2_created = True
             trade.protection_qty = trade.filled_qty
-            return []
+            return created
 
-        tp1_qty = int(trade.filled_qty * self.execution.tp1_fraction)
-        tp1_qty = max(1, min(tp1_qty, trade.filled_qty))
-        tp2_qty = trade.filled_qty - tp1_qty
+        tp1_qty, tp2_qty = self._protection_split(trade.filled_qty)
         created = []
         if tp1_qty > 0:
             created.append(self._create_exit(trade, "tp1", "SELL", tp1_qty, "LMT", timestamp, price=trade.target1_price))
@@ -125,6 +147,11 @@ class ExecutionManager:
         trade.stop_created = True
         trade.protection_qty = trade.filled_qty
         return created
+
+    def _protection_split(self, quantity: int) -> tuple[int, int]:
+        tp1_qty = int(quantity * self.execution.tp1_fraction)
+        tp1_qty = max(1, min(tp1_qty, quantity))
+        return tp1_qty, quantity - tp1_qty
 
     def _create_exit(
         self,
@@ -143,8 +170,8 @@ class ExecutionManager:
             side=side,
             qty=qty,
             order_type=order_type,
-            price=price,
-            stop_price=stop_price,
+            price=round_to_tick(price, self.market.tick_size, "up") if price is not None else None,
+            stop_price=round_to_tick(stop_price, self.market.tick_size, "down") if stop_price is not None else None,
             role=role,
             status=OrderStatus.SUBMITTED,
             created_at=timestamp,
@@ -158,7 +185,7 @@ class ExecutionManager:
 
     def tighten_stop_to_breakeven(self, trade_id: str, buffer_ticks: int = 0) -> None:
         trade = self.trades[trade_id]
-        new_stop = trade.entry_price - buffer_ticks * self.market.tick_size
+        new_stop = round_to_tick(trade.entry_price - buffer_ticks * self.market.tick_size, self.market.tick_size, "down")
         for order in trade.orders.values():
             if order.role == "stop" and order.status in {OrderStatus.SUBMITTED, OrderStatus.PARTIALLY_FILLED}:
                 order.stop_price = max(order.stop_price or new_stop, new_stop)

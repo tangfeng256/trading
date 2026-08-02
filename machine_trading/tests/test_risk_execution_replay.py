@@ -33,6 +33,37 @@ def test_partial_fill_creates_protection_for_filled_quantity_only():
     assert stop.qty == 40
 
 
+def test_late_entry_fill_resizes_queued_protection_to_total_fill():
+    manager = ExecutionManager(ExecutionConfig(tp1_fraction=0.33), MarketConfig(), StrategyConfig())
+    trade = manager.submit_entry(_signal(), qty=121)
+    queued = manager.on_fill(trade.entry_order_id, fill_qty=100, fill_price=100.0, timestamp=_now())
+
+    manager.on_fill(trade.entry_order_id, fill_qty=21, fill_price=100.0, timestamp=_now() + timedelta(milliseconds=100))
+
+    tp1 = next(order for order in queued if order.role == "tp1")
+    tp2 = next(order for order in queued if order.role == "tp2")
+    stop = next(order for order in queued if order.role == "stop")
+    assert (tp1.qty, tp2.qty, stop.qty) == (39, 82, 121)
+    assert tp1.qty + tp2.qty == trade.filled_qty
+    assert trade.protection_qty == trade.filled_qty
+
+
+def test_execution_prices_are_rounded_to_market_tick():
+    manager = ExecutionManager(ExecutionConfig(tp1_fraction=0.5), MarketConfig(tick_size=0.01), StrategyConfig())
+    trade = manager.submit_entry(_signal(entry=203.085, stop=202.6122, target1=203.8817, target2=204.6434), qty=100)
+    entry = manager.orders[trade.entry_order_id]
+
+    created = manager.on_fill(trade.entry_order_id, fill_qty=100, fill_price=203.09, timestamp=_now())
+    stop = next(order for order in created if order.role == "stop")
+    tp1 = next(order for order in created if order.role == "tp1")
+    tp2 = next(order for order in created if order.role == "tp2")
+
+    assert entry.price == 203.10
+    assert stop.stop_price == 202.61
+    assert tp1.price == 203.89
+    assert tp2.price == 204.65
+
+
 def test_tp1_does_not_create_duplicate_stop_target_pairs():
     manager = ExecutionManager(ExecutionConfig(tp1_fraction=0.5), MarketConfig(), StrategyConfig())
     trade = manager.submit_entry(_signal(), qty=100)
@@ -42,6 +73,22 @@ def test_tp1_does_not_create_duplicate_stop_target_pairs():
     assert second == []
     assert sum(1 for order in trade.orders.values() if order.role == "stop") == 1
     assert sum(1 for order in trade.orders.values() if order.role == "tp1") == 1
+
+
+def test_exit_fills_accumulate_realized_pnl_and_close_only_when_flat():
+    manager = ExecutionManager(ExecutionConfig(tp1_fraction=0.5), MarketConfig(), StrategyConfig())
+    trade = manager.submit_entry(_signal(), qty=100)
+    exits = manager.on_fill(trade.entry_order_id, fill_qty=100, fill_price=100.0, timestamp=_now())
+    tp1 = next(order for order in exits if order.role == "tp1")
+    stop = next(order for order in exits if order.role == "stop")
+
+    manager.on_fill(tp1.order_id, fill_qty=50, fill_price=101.0, timestamp=_now())
+    assert trade.realized_pnl == 50.0
+    assert trade.status == TradeStatus.OPEN
+
+    manager.on_fill(stop.order_id, fill_qty=50, fill_price=100.0, timestamp=_now())
+    assert trade.realized_pnl == 50.0
+    assert trade.status == TradeStatus.CLOSED
 
 
 def test_max_hold_exits_position():
@@ -95,7 +142,7 @@ def _now():
     return datetime(2026, 5, 25, 14, 0, tzinfo=timezone.utc)
 
 
-def _signal(timestamp=None, entry=100.00, stop=99.50):
+def _signal(timestamp=None, entry=100.00, stop=99.50, target1=100.50, target2=101.00):
     timestamp = timestamp or _now()
     return Signal(
         symbol="NVDA",
@@ -104,8 +151,8 @@ def _signal(timestamp=None, entry=100.00, stop=99.50):
         entry_ref_price=entry,
         absorption_level=99.90,
         stop_price=stop,
-        target1_price=100.50,
-        target2_price=101.00,
+        target1_price=target1,
+        target2_price=target2,
         confidence=0.8,
         reason_codes=["test"],
         feature_snapshot={"spread_bps": 1.0},

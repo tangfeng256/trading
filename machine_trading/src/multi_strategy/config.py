@@ -27,6 +27,7 @@ class IBConfig:
     trailing_min_step_bps: float = 5.0
     runner_target_enabled: bool = True
     runner_target_r_multiple: float = 6.0
+    fail_closed_on_depth_permission_error: bool = False
     historical_duration: str = "2 D"
     bar_size: str = "1 min"
     use_rth: bool = True
@@ -42,17 +43,23 @@ class StrategyFiles:
 
 @dataclass
 class RuntimeConfig:
-    symbols: list[str] = field(default_factory=lambda: ["NVDA", "TSLA", "AMD", "TQQQ"])
+    symbols: list[str] = field(default_factory=lambda: ["NVDA", "TSLA", "MU", "TQQQ"])
     enabled_strategies: list[str] = field(default_factory=lambda: ["opening_range", "pullback", "absorption"])
     strategy_priority: list[str] = field(default_factory=lambda: ["opening_range", "pullback", "absorption"])
     trading_timezone: str = "America/New_York"
     trading_start: str = "09:30:00"
-    trading_end: str = "11:00:00"
+    trading_end: str = "13:00:00"
     flatten_before_window_end_seconds: int = 60
     post_window_position_check_seconds: int = 30
     forced_flatten_cooldown_seconds: int = 3600
+    stop_loss_cooldown_seconds: int = 600
+    auto_stop_after_window_seconds: int = 120
+    quarantine_unmanaged_positions: bool = True
+    reconcile_account_positions: bool = True
     lock_on_entry_order: bool = True
     manage_account_positions: bool = False
+    startup_position_action: str = "prompt"
+    position_flatten_timeout_seconds: int = 60
     live_trading_enabled: bool = False
     dry_run: bool = False
     log_root: str = "runs"
@@ -64,6 +71,12 @@ class RuntimeConfig:
                 datetime.strptime(val, "%H:%M:%S")
             except ValueError:
                 raise ValueError(f"runtime.{attr} must be HH:MM:SS, got: {val!r}")
+        allowed_actions = {"prompt", "close", "abort", "continue"}
+        if self.startup_position_action not in allowed_actions:
+            choices = ", ".join(sorted(allowed_actions))
+            raise ValueError(f"runtime.startup_position_action must be one of {choices}")
+        if self.position_flatten_timeout_seconds < 1:
+            raise ValueError("runtime.position_flatten_timeout_seconds must be at least 1")
 
 
 @dataclass

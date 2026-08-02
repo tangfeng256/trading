@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from multi_strategy.broker import SharedBroker
 from multi_strategy.registry import PositionRegistry
@@ -21,9 +21,13 @@ class _Receiver:
 
     def __init__(self):
         self.fills = []
+        self.commissions = []
 
     def on_broker_fill(self, order_id, timestamp, quantity, price, commission=0.0):
         self.fills.append((order_id, quantity, price))
+
+    def on_broker_commission(self, timestamp, commission):
+        self.commissions.append((timestamp, commission))
 
 
 class _Order:
@@ -37,10 +41,11 @@ class _Order:
 
 
 class _Execution:
-    def __init__(self, shares, price=100.0):
+    def __init__(self, shares, price=100.0, exec_id=None):
         self.time = datetime(2026, 5, 27, 14, 30, tzinfo=timezone.utc)
         self.shares = shares
         self.price = price
+        self.execId = exec_id
 
 
 class _Fill:
@@ -179,8 +184,8 @@ def test_shared_broker_allows_full_stop_alongside_reserved_targets():
     broker._place(receiver, "NVDA", "stop-5", "stop", _Order("SELL", 117))
 
     assert [order.totalQuantity for order in ib.orders[-3:]] == [58, 59, 117]
-    assert all(order.ocaGroup == "absorption-NVDA-exit" for order in ib.orders[-3:])
-    assert all(order.ocaType == 2 for order in ib.orders[-3:])
+    # OCA groups are intentionally not used; stop and targets are managed independently.
+    assert not any(getattr(order, "ocaGroup", "") for order in ib.orders[-3:])
     assert broker.exit_reservations[("absorption", "NVDA")] == 117
     assert not any(event[0] == "sell_order_rejected_no_long_inventory" for event in logger.events)
 
@@ -208,7 +213,7 @@ def test_shared_broker_flattens_when_price_breaches_stop_but_position_remains():
     ib = _IB()
     logger = _Logger()
     receiver = _Receiver()
-    broker = SharedBroker(ib, {"NVDA": object()}, PositionRegistry(), logger)
+    broker = SharedBroker(ib, {"NVDA": object()}, PositionRegistry(), logger, software_stop_breach_enabled=True)
     broker._market_order = lambda side, qty: _Order(side, qty, order_type="MKT")
 
     broker._place(receiver, "NVDA", "entry-1", "entry", _Order("BUY", 117, limit_price=213.58))
@@ -340,6 +345,33 @@ def test_shared_broker_logs_ib_order_lifecycle_events():
     assert commission_rows[0]["commission"] == 0.25
 
 
+def test_shared_broker_applies_split_exec_details_when_fill_event_misses_one():
+    ib = _IB()
+    logger = _Logger()
+    receiver = _Receiver()
+    broker = SharedBroker(ib, {"NVDA": _Contract("NVDA")}, PositionRegistry(), logger)
+
+    broker._place(receiver, "NVDA", "entry-1", "entry", _Order("BUY", 20, limit_price=207.63))
+    broker._on_fill("entry-1", _Fill(20, 207.63))
+    broker._place(receiver, "NVDA", "flatten-1", "flatten", _Order("SELL", 20, order_type="MKT"))
+
+    trade = ib.trade_list[-1]
+    for exec_id in ("exec-a", "exec-b"):
+        fill = _Fill(10, 206.16)
+        fill.execution.orderId = trade.order.orderId
+        fill.execution.permId = 901713526
+        fill.execution.execId = exec_id
+        fill.execution.side = "SLD"
+        fill.execution.avgPrice = 206.16
+        fill.execution.exchange = "ARCA"
+        fill.contract = _Contract("NVDA")
+        ib.execDetailsEvent.fire(trade, fill)
+
+    fill_rows = [row for name, row in logger.rows if name == "fills" and row["order_id"] == "flatten-1"]
+    assert [row["quantity"] for row in fill_rows] == [10, 10]
+    assert ("absorption", "NVDA") not in broker.long_positions
+
+
 def test_shared_broker_rejects_new_entry_while_long_inventory_remains():
     ib = _IB()
     logger = _Logger()
@@ -385,11 +417,60 @@ def test_shared_broker_trails_stop_after_position_moves_in_favor():
 
     broker.update_trailing_stops("NVDA", 232.30, datetime(2026, 6, 2, 14, 0, tzinfo=timezone.utc))
 
-    assert ib.orders[-1].auxPrice == 231.487
+    assert ib.orders[-1].auxPrice == 231.48
     assert ib.modifications == [ib.orders[-1]]
     assert logger.events[-1][0] == "trailing_stop_updated"
     assert logger.events[-1][1]["old_stop"] == 225.745
-    assert logger.events[-1][1]["new_stop"] == 231.487
+    assert logger.events[-1][1]["new_stop"] == 231.48
+
+
+def test_shared_broker_rounds_trailing_stop_to_tick_and_defers_transient_amendment_cancel():
+    ib = _IB()
+    logger = _Logger()
+    receiver = _Receiver()
+    broker = SharedBroker(ib, {"NVDA": object()}, PositionRegistry(), logger, exit_ack_timeout_seconds=3)
+    broker._market_order = lambda side, qty: _Order(side, qty, order_type="MKT")
+
+    broker._place(receiver, "NVDA", "entry-1", "entry", _Order("BUY", 100, limit_price=209.07))
+    broker._on_fill("entry-1", _Fill(100, 209.07))
+    broker._place(receiver, "NVDA", "stop-5", "stop", _Order("SELL", 100, order_type="STP", stop_price=208.55))
+    stop_trade = ib.trade_list[-1]
+    stop_trade.order.permId = 123
+    amended_at = datetime(2026, 7, 13, 13, 33, tzinfo=timezone.utc)
+
+    broker._raise_stop("absorption", "NVDA", "stop-5", 209.4145, amended_at)
+    assert stop_trade.order.auxPrice == 209.41
+
+    stop_trade.orderStatus.status = "Cancelled"
+    broker._handle_exit_order_status(stop_trade, now=amended_at + timedelta(milliseconds=100))
+
+    assert not any(event[0] == "forced_flatten_submitted" for event in logger.events)
+    assert "stop-5" in broker._exit_pending_ack
+    assert any(event[0] == "exit_order_amendment_status_pending" for event in logger.events)
+
+    stop_trade.orderStatus.status = "PreSubmitted"
+    broker.resubmit_unacknowledged_exits(amended_at + timedelta(seconds=3))
+
+    assert "stop-5" not in broker._exit_pending_ack
+    assert "stop-5" not in broker._exit_amendments
+    assert not any(event[0] == "forced_flatten_submitted" for event in logger.events)
+
+
+def test_shared_broker_routes_commission_report_to_fill_receiver_once():
+    ib = _IB()
+    logger = _Logger()
+    receiver = _Receiver()
+    broker = SharedBroker(ib, {"NVDA": object()}, PositionRegistry(), logger)
+    broker._place(receiver, "NVDA", "entry-1", "entry", _Order("BUY", 10, limit_price=100.0))
+    fill = _Fill(10, 100.0)
+    fill.execution.execId = "exec-1"
+    broker._on_fill("entry-1", fill)
+    report = type("CommissionReport", (), {"execId": "exec-1", "commission": 1.25})()
+
+    broker._on_ib_commission_report_event(report)
+    broker._on_ib_commission_report_event(report)
+
+    assert receiver.commissions == [(fill.execution.time, 1.25)]
 
 
 def test_shared_broker_never_lowers_trailing_stop():
@@ -425,6 +506,7 @@ def test_shared_broker_promotes_lower_target_when_far_target_fills_first():
     broker._place(receiver, "NVDA", "tp1-3", "tp1", _Order("SELL", 55, limit_price=227.415))
     broker._place(receiver, "NVDA", "tp2-4", "tp2", _Order("SELL", 55, limit_price=228.25))
     broker._place(receiver, "NVDA", "stop-5", "stop", _Order("SELL", 110, order_type="STP", stop_price=225.745))
+    ib.orders[3].permId = 67108270
 
     broker._on_fill("tp2-4", _Fill(55, 228.25))
 
@@ -450,6 +532,7 @@ def test_shared_broker_marketizes_remaining_tp1_after_partial_fill():
     broker._place(receiver, "NVDA", "tp1-3", "tp1", _Order("SELL", 50, limit_price=201.5))
     broker._place(receiver, "NVDA", "tp2-4", "tp2", _Order("SELL", 50, limit_price=203.0))
     broker._place(receiver, "NVDA", "stop-5", "stop", _Order("SELL", 100, order_type="STP", stop_price=198.5))
+    ib.orders[3].permId = 67108270
 
     broker._on_fill("tp1-3", _Fill(10, 201.5))
 
@@ -485,6 +568,35 @@ def test_shared_broker_flatten_cancels_reserved_exits_before_market_sell():
     assert ib.orders[-1].totalQuantity == 100
     assert ib.cancelled == ib.orders[1:4]
     assert not any(event[0] == "sell_order_rejected_no_long_inventory" for event in logger.events)
+
+
+def test_shared_broker_retires_closed_position_orders_before_next_trade():
+    ib = _IB()
+    logger = _Logger()
+    receiver = _Receiver()
+    broker = SharedBroker(ib, {"NVDA": object()}, PositionRegistry(), logger)
+
+    broker._place(receiver, "NVDA", "entry-1", "entry", _Order("BUY", 100, limit_price=200.0))
+    broker._on_fill("entry-1", _Fill(100, 200.0))
+    broker._place(receiver, "NVDA", "tp1-3", "tp1", _Order("SELL", 50, limit_price=201.0))
+    broker._place(receiver, "NVDA", "tp2-4", "tp2", _Order("SELL", 50, limit_price=202.0))
+    broker._place(receiver, "NVDA", "stop-5", "stop", _Order("SELL", 100, order_type="STP", stop_price=198.5))
+    broker._on_fill("stop-5", _Fill(100, 198.5))
+
+    assert not any(ref in broker.tracked_by_ref for ref in ("entry-1", "tp1-3", "tp2-4", "stop-5"))
+    first_cancelled = list(ib.cancelled)
+    assert ib.orders[3] not in first_cancelled  # never cancel the order whose fill closed the position
+
+    broker._place(receiver, "NVDA", "entry-6", "entry", _Order("BUY", 100, limit_price=200.0))
+    broker._on_fill("entry-6", _Fill(100, 200.0))
+    broker._place(receiver, "NVDA", "tp1-8", "tp1", _Order("SELL", 50, limit_price=201.0))
+    broker._place(receiver, "NVDA", "stop-10", "stop", _Order("SELL", 100, order_type="STP", stop_price=198.5))
+    broker._on_fill("stop-10", _Fill(100, 198.5))
+
+    newly_cancelled = ib.cancelled[len(first_cancelled):]
+    assert ib.orders[1] not in newly_cancelled
+    assert ib.orders[2] not in newly_cancelled
+    assert all(order in ib.orders[5:7] for order in newly_cancelled)
 
 
 def test_shared_broker_forced_flatten_all_positions():
@@ -608,6 +720,95 @@ def test_shared_broker_retries_pending_forced_flatten_for_remaining_position():
     assert any(event[0] == "forced_flatten_retry" for event in logger.events)
 
 
+def test_shared_broker_resizes_forced_flatten_after_late_entry_fill():
+    ib = _IB()
+    logger = _Logger()
+    receiver = _Receiver()
+    broker = SharedBroker(ib, {"NVDA": object()}, PositionRegistry(), logger)
+    broker._market_order = lambda side, qty: _Order(side, qty, order_type="MKT")
+
+    broker._place(receiver, "NVDA", "entry-188", "entry", _Order("BUY", 127, limit_price=196.22))
+    broker._on_fill("entry-188", _Fill(100, 196.22))
+    broker.flatten_all_positions(datetime(2026, 7, 6, 14, 4, 48, tzinfo=timezone.utc), reason="trading_window_close")
+
+    broker._on_fill("entry-188", _Fill(27, 196.22))
+
+    flatten_order = ib.orders[1]
+    assert flatten_order.action == "SELL"
+    assert flatten_order.totalQuantity == 127
+    assert ib.modifications == [flatten_order]
+    assert any(event[0] == "late_entry_fill_after_flatten_detected" for event in logger.events)
+
+
+def test_shared_broker_submits_fresh_flatten_when_late_entry_fill_arrives_after_flatten_fill():
+    ib = _IB()
+    logger = _Logger()
+    receiver = _Receiver()
+    broker = SharedBroker(ib, {"NVDA": object()}, PositionRegistry(), logger)
+    broker._market_order = lambda side, qty: _Order(side, qty, order_type="MKT")
+
+    broker._place(receiver, "NVDA", "entry-188", "entry", _Order("BUY", 127, limit_price=196.22))
+    broker._on_fill("entry-188", _Fill(100, 196.22))
+    broker.flatten_all_positions(datetime(2026, 7, 6, 14, 4, 48, tzinfo=timezone.utc), reason="trading_window_close")
+    broker._on_fill("flatten-absorption-NVDA-20260706140448", _Fill(100, 196.19))
+
+    broker._on_fill("entry-188", _Fill(27, 196.22))
+
+    fresh_flatten = ib.orders[-1]
+    assert fresh_flatten is not ib.orders[1]
+    assert fresh_flatten.action == "SELL"
+    assert fresh_flatten.orderType == "MKT"
+    assert fresh_flatten.totalQuantity == 27
+    assert any(event[0] == "late_entry_fill_after_flatten_detected" for event in logger.events)
+
+
+def test_shared_broker_resubmits_remaining_forced_flatten_when_resize_hit_filled_order():
+    ib = _IB()
+    logger = _Logger()
+    receiver = _Receiver()
+    broker = SharedBroker(ib, {"NVDA": object()}, PositionRegistry(), logger)
+    broker._market_order = lambda side, qty: _Order(side, qty, order_type="MKT")
+
+    broker._place(receiver, "NVDA", "entry-188", "entry", _Order("BUY", 123, limit_price=203.24))
+    broker._on_fill("entry-188", _Fill(100, 203.24))
+    broker.flatten_all_positions(datetime(2026, 7, 9, 13, 36, 23, tzinfo=timezone.utc), reason="exit_order_ack_timeout")
+    broker._on_fill("entry-188", _Fill(23, 203.24))
+    broker._on_fill("flatten-absorption-NVDA-20260709133623", _Fill(100, 203.20))
+
+    broker._on_ib_error_event(2, 104, "Cannot modify a filled order.", None)
+
+    fresh_flatten = ib.orders[-1]
+    assert fresh_flatten is not ib.orders[1]
+    assert fresh_flatten.action == "SELL"
+    assert fresh_flatten.orderType == "MKT"
+    assert fresh_flatten.totalQuantity == 23
+    assert any(event[0] == "forced_flatten_modify_filled_resubmit" for event in logger.events)
+
+
+def test_shared_broker_does_not_flatten_new_entry_after_prior_flatten_watch():
+    ib = _IB()
+    logger = _Logger()
+    receiver = _Receiver()
+    broker = SharedBroker(ib, {"NVDA": object()}, PositionRegistry(), logger)
+    broker._market_order = lambda side, qty: _Order(side, qty, order_type="MKT")
+
+    broker._place(receiver, "NVDA", "entry-188", "entry", _Order("BUY", 127, limit_price=196.22))
+    broker._on_fill("entry-188", _Fill(100, 196.22))
+    broker.flatten_all_positions(datetime(2026, 7, 6, 14, 4, 48, tzinfo=timezone.utc), reason="trading_window_close")
+    broker._on_fill("flatten-absorption-NVDA-20260706140448", _Fill(100, 196.19))
+
+    broker._place(receiver, "NVDA", "entry-2", "entry", _Order("BUY", 10, limit_price=197.0))
+    order_count = len(ib.orders)
+    broker._on_fill("entry-2", _Fill(10, 197.0))
+
+    assert len(ib.orders) == order_count
+    assert broker.long_positions[("absorption", "NVDA")] == 10
+    assert not any(
+        event[0] == "late_entry_fill_after_flatten_detected" and event[1].get("order_id") == "entry-2"
+        for event in logger.events
+    )
+
+
 def test_shared_broker_sync_clears_account_position_when_ib_no_longer_reports_it():
     ib = _IB()
     ib.account_positions = [_Position("AMD", 25, 495.91)]
@@ -717,6 +918,143 @@ def test_shared_broker_syncs_stop_quantity_after_late_entry_partial_fill():
 
     stop = ib.orders[1]
     assert broker.long_positions[("absorption", "NVDA")] == 123
+    assert stop.totalQuantity == 100
+    assert stop not in ib.modifications
+    assert broker.pending_stop_quantities[("absorption", "NVDA")] == 123
+    assert any(event[0] == "stop_quantity_update_pending" for event in logger.events)
+
+
+def test_shared_broker_applies_pending_stop_quantity_when_stop_acknowledged():
+    ib = _IB()
+    logger = _Logger()
+    receiver = _Receiver()
+    broker = SharedBroker(ib, {"NVDA": _Contract("NVDA")}, PositionRegistry(), logger)
+
+    broker._place(receiver, "NVDA", "entry-1", "entry", _Order("BUY", 120, limit_price=207.63))
+    broker._on_fill("entry-1", _Fill(100, 207.63))
+    broker._place(receiver, "NVDA", "stop-5", "stop", _Order("SELL", 100, order_type="STP", stop_price=207.10))
+
+    broker._on_fill("entry-1", _Fill(20, 207.63))
+
+    stop_trade = ib.trade_list[1]
+    stop = stop_trade.order
+    assert stop.totalQuantity == 100
+    assert broker.pending_stop_quantities[("absorption", "NVDA")] == 120
+
+    stop.permId = 67108270
+    stop_trade.orderStatus.status = "PreSubmitted"
+    ib.openOrderEvent.fire(stop_trade)
+
+    assert stop.totalQuantity == 120
+    assert stop in ib.modifications
+    assert ("absorption", "NVDA") not in broker.pending_stop_quantities
+    assert any(event[0] == "stop_quantity_updated" and event[1]["new_qty"] == 120 for event in logger.events)
+
+
+def test_shared_broker_resizes_targets_after_late_entry_fill():
+    ib = _IB()
+    logger = _Logger()
+    receiver = _Receiver()
+    broker = SharedBroker(ib, {"TSLA": _Contract("TSLA")}, PositionRegistry(), logger)
+
+    broker._place(receiver, "TSLA", "entry-1", "entry", _Order("BUY", 65, limit_price=379.01))
+    broker._on_fill("entry-1", _Fill(40, 379.01))
+    broker._place(receiver, "TSLA", "tp1-3", "tp1", _Order("SELL", 13, limit_price=380.42))
+    broker._place(receiver, "TSLA", "tp2-4", "tp2", _Order("SELL", 27, limit_price=381.84))
+    broker._place(receiver, "TSLA", "stop-5", "stop", _Order("SELL", 40, order_type="STP", stop_price=378.04))
+
+    for trade in ib.trade_list[1:]:
+        trade.order.permId = 1000 + trade.order.orderId
+        trade.orderStatus.status = "PreSubmitted"
+
+    broker._on_fill("entry-1", _Fill(25, 379.01))
+    resized = [
+        type("Managed", (), {"order_id": "tp1-3", "qty": 21, "filled_qty": 0})(),
+        type("Managed", (), {"order_id": "tp2-4", "qty": 44, "filled_qty": 0})(),
+        type("Managed", (), {"order_id": "stop-5", "qty": 65, "filled_qty": 0})(),
+    ]
+    broker.sync_protective_order_quantities(receiver, resized)
+
+    tp1, tp2, stop = (trade.order for trade in ib.trade_list[1:])
+    assert (tp1.totalQuantity, tp2.totalQuantity, stop.totalQuantity) == (21, 44, 65)
+    assert broker.exit_reservations[("absorption", "TSLA")] == 65
+    assert broker.exit_reservations_by_ref["tp1-3"] == 21
+    assert broker.exit_reservations_by_ref["tp2-4"] == 44
+    assert all(order in ib.modifications for order in (tp1, tp2, stop))
+    assert sum(event[0] == "target_quantity_updated" for event in logger.events) == 2
+
+
+def test_shared_broker_applies_pending_target_resize_after_ib_acknowledgement():
+    ib = _IB()
+    logger = _Logger()
+    receiver = _Receiver()
+    broker = SharedBroker(ib, {"TSLA": _Contract("TSLA")}, PositionRegistry(), logger)
+
+    broker._place(receiver, "TSLA", "entry-1", "entry", _Order("BUY", 66, limit_price=377.92))
+    broker._on_fill("entry-1", _Fill(50, 377.92))
+    broker._place(receiver, "TSLA", "tp1-3", "tp1", _Order("SELL", 16, limit_price=379.33))
+    broker._place(receiver, "TSLA", "tp2-4", "tp2", _Order("SELL", 34, limit_price=380.75))
+    broker._on_fill("entry-1", _Fill(16, 377.92))
+
+    resized = [
+        type("Managed", (), {"order_id": "tp1-3", "qty": 21, "filled_qty": 0})(),
+        type("Managed", (), {"order_id": "tp2-4", "qty": 45, "filled_qty": 0})(),
+    ]
+    broker.sync_protective_order_quantities(receiver, resized)
+
+    tp1_trade, tp2_trade = ib.trade_list[1:]
+    assert (tp1_trade.order.totalQuantity, tp2_trade.order.totalQuantity) == (16, 34)
+    assert broker.pending_target_quantities == {"tp1-3": 21, "tp2-4": 45}
+
+    for trade in (tp1_trade, tp2_trade):
+        trade.order.permId = 2000 + trade.order.orderId
+        trade.orderStatus.status = "PreSubmitted"
+        ib.openOrderEvent.fire(trade)
+
+    assert (tp1_trade.order.totalQuantity, tp2_trade.order.totalQuantity) == (21, 45)
+    assert broker.exit_reservations[("absorption", "TSLA")] == 66
+    assert broker.pending_target_quantities == {}
+
+
+def test_shared_broker_flattens_remainder_when_underprotected_stop_fills():
+    ib = _IB()
+    logger = _Logger()
+    receiver = _Receiver()
+    broker = SharedBroker(ib, {"NVDA": _Contract("NVDA")}, PositionRegistry(), logger)
+    broker._market_order = lambda side, qty: _Order(side, qty, order_type="MKT")
+
+    broker._place(receiver, "NVDA", "entry-1", "entry", _Order("BUY", 120, limit_price=207.63))
+    broker._on_fill("entry-1", _Fill(120, 207.63))
+    broker._place(receiver, "NVDA", "stop-5", "stop", _Order("SELL", 100, order_type="STP", stop_price=207.10))
+
+    broker._on_fill("stop-5", _Fill(80, 207.08))
+    assert not any(event[0] == "stop_quantity_updated" for event in logger.events)
+
+    broker._on_fill("stop-5", _Fill(20, 207.08))
+
+    flatten = ib.orders[-1]
+    assert flatten.orderType == "MKT"
+    assert flatten.action == "SELL"
+    assert flatten.totalQuantity == 20
+    assert broker.long_positions[("absorption", "NVDA")] == 20
+    assert any(event[0] == "stop_filled_position_remaining_flatten" and event[1]["quantity"] == 20 for event in logger.events)
+
+
+def test_shared_broker_syncs_stop_quantity_amends_ib_when_stop_acknowledged():
+    ib = _IB()
+    logger = _Logger()
+    receiver = _Receiver()
+    broker = SharedBroker(ib, {"NVDA": object()}, PositionRegistry(), logger)
+
+    broker._place(receiver, "NVDA", "entry-1", "entry", _Order("BUY", 123, limit_price=202.49))
+    broker._on_fill("entry-1", _Fill(100, 202.41))
+    broker._place(receiver, "NVDA", "stop-5", "stop", _Order("SELL", 100, order_type="STP", stop_price=201.97))
+
+    stop = ib.orders[1]
+    stop.permId = 67108270  # simulate IB acknowledgement
+
+    broker._on_fill("entry-1", _Fill(23, 202.32))
+
     assert stop.totalQuantity == 123
     assert stop in ib.modifications
     assert any(event[0] == "stop_quantity_updated" for event in logger.events)
@@ -732,3 +1070,401 @@ def test_shared_broker_lock_or_raise_does_not_raise_when_same_strategy_holds_ope
     broker._on_fill("entry-1", _Fill(100, 200.0))
     # registry now holds OPEN for "absorption"; re-calling _lock_or_raise must not raise
     broker._lock_or_raise("NVDA", "absorption", datetime(2026, 6, 2, 14, 0, tzinfo=timezone.utc), "test")
+
+
+def test_shared_broker_does_not_resubmit_unacknowledged_exit_order_on_intermediate_check():
+    ib = _IB()
+    logger = _Logger()
+    receiver = _Receiver()
+    contract = _Contract("NVDA")
+    broker = SharedBroker(ib, {"NVDA": contract}, PositionRegistry(), logger, exit_ack_timeout_seconds=5, exit_ack_max_wait_seconds=30)
+
+    # Place entry and fill to establish a position
+    broker._place(receiver, "NVDA", "entry-1", "entry", _Order("BUY", 100, limit_price=210.0))
+    broker._on_fill("entry-1", _Fill(100, 210.0))
+
+    # Place stop order; it goes into _exit_pending_ack.
+    stop_order = _Order("SELL", 100, order_type="STP", stop_price=208.0)
+    broker._place(receiver, "NVDA", "stop-2", "stop", stop_order)
+
+    # Simulate IB not acknowledging: order sits in PendingSubmit
+    stop_trade = ib.trade_list[-1]
+    stop_trade.orderStatus.status = "PendingSubmit"
+
+    # Manually backdate the submission time so it appears 6 seconds old (past
+    # exit_ack_timeout_seconds=5, but well within exit_ack_max_wait_seconds=30)
+    submitted_at, _ = broker._exit_pending_ack["stop-2"]
+    broker._exit_pending_ack["stop-2"] = (submitted_at - timedelta(seconds=6), 0)
+
+    broker.resubmit_unacknowledged_exits(datetime.now(timezone.utc))
+
+    # No resubmit: reusing the orderId for a still-unacknowledged order looks like a
+    # duplicate submission to IB and provokes an error that ib_insync turns into an
+    # unsolicited cancel, which used to cascade into an immediate forced flatten.
+    assert stop_trade.order not in ib.modifications
+    assert not any(e[0] == "exit_order_resubmitted" for e in logger.events)
+    pending_event = next(e[1] for e in logger.events if e[0] == "exit_order_ack_pending")
+    assert pending_event["order_id"] == "stop-2"
+    assert pending_event["check"] == 1
+    # Position still being monitored; not yet flattened
+    assert "stop-2" in broker._exit_pending_ack
+    _, checks = broker._exit_pending_ack["stop-2"]
+    assert checks == 1
+
+
+def test_shared_broker_flattens_position_when_exit_order_never_acknowledged():
+    ib = _IB()
+    logger = _Logger()
+    receiver = _Receiver()
+    contract = _Contract("NVDA")
+    broker = SharedBroker(ib, {"NVDA": contract}, PositionRegistry(), logger, exit_ack_timeout_seconds=5, exit_ack_max_wait_seconds=20)
+    broker._market_order = lambda side, qty: _Order(side, qty, order_type="MKT")
+
+    broker._place(receiver, "NVDA", "entry-1", "entry", _Order("BUY", 100, limit_price=210.0))
+    broker._on_fill("entry-1", _Fill(100, 210.0))
+
+    stop_order = _Order("SELL", 100, order_type="STP", stop_price=208.0)
+    broker._place(receiver, "NVDA", "stop-2", "stop", stop_order)
+
+    stop_trade = ib.trade_list[-1]
+    stop_trade.orderStatus.status = "PendingSubmit"
+
+    submitted_at, _ = broker._exit_pending_ack["stop-2"]
+    broker._exit_pending_ack["stop-2"] = (submitted_at - timedelta(seconds=21), 0)
+
+    broker.resubmit_unacknowledged_exits(datetime.now(timezone.utc))
+
+    assert any(e[0] == "exit_order_ack_timeout_flatten" for e in logger.events)
+    flatten_event = next(e[1] for e in logger.events if e[0] == "exit_order_ack_timeout_flatten")
+    assert flatten_event["symbol"] == "NVDA"
+    assert flatten_event["status"] == "PendingSubmit"
+    assert ib.orders[-1].orderType == "MKT"
+    assert ib.orders[-1].totalQuantity == 100
+    assert "stop-2" not in broker._exit_pending_ack
+
+
+def test_shared_broker_does_not_flatten_when_target_order_never_acknowledged():
+    ib = _IB()
+    logger = _Logger()
+    receiver = _Receiver()
+    contract = _Contract("NVDA")
+    broker = SharedBroker(ib, {"NVDA": contract}, PositionRegistry(), logger, exit_ack_timeout_seconds=5, exit_ack_max_wait_seconds=20)
+    broker._market_order = lambda side, qty: _Order(side, qty, order_type="MKT")
+
+    broker._place(receiver, "NVDA", "entry-1", "entry", _Order("BUY", 100, limit_price=210.0))
+    broker._on_fill("entry-1", _Fill(100, 210.0))
+
+    broker._place(receiver, "NVDA", "tp1-2", "tp1", _Order("SELL", 40, limit_price=211.0))
+    broker._place(receiver, "NVDA", "stop-3", "stop", _Order("SELL", 100, order_type="STP", stop_price=208.0))
+
+    assert "tp1-2" not in broker._exit_pending_ack
+    assert "stop-3" in broker._exit_pending_ack
+
+    target_trade = ib.trade_list[-2]
+    target_trade.orderStatus.status = "PendingSubmit"
+    broker.resubmit_unacknowledged_exits(datetime.now(timezone.utc) + timedelta(seconds=30))
+
+    assert not any(e[0] == "exit_order_ack_timeout_flatten" and e[1]["order_id"] == "tp1-2" for e in logger.events)
+    assert not any(e[0] == "forced_flatten_submitted" for e in logger.events)
+    assert ib.orders[-1].orderType == "STP"
+
+
+def test_shared_broker_flattens_when_protective_exit_is_cancelled_unexpectedly():
+    ib = _IB()
+    logger = _Logger()
+    receiver = _Receiver()
+    broker = SharedBroker(ib, {"NVDA": _Contract("NVDA")}, PositionRegistry(), logger)
+    broker._market_order = lambda side, qty: _Order(side, qty, order_type="MKT")
+
+    broker._place(receiver, "NVDA", "entry-1", "entry", _Order("BUY", 100, limit_price=210.0))
+    broker._on_fill("entry-1", _Fill(100, 210.0))
+    broker._place(receiver, "NVDA", "stop-2", "stop", _Order("SELL", 100, order_type="STP", stop_price=208.0))
+
+    stop_trade = ib.trade_list[-1]
+    stop_trade.orderStatus.status = "Cancelled"
+    ib.orderStatusEvent.fire(stop_trade)
+
+    assert any(e[0] == "exit_order_cancelled_flatten" for e in logger.events)
+    cancel_event = next(e[1] for e in logger.events if e[0] == "exit_order_cancelled_flatten")
+    assert cancel_event["order_id"] == "stop-2"
+    assert cancel_event["status"] == "Cancelled"
+    assert ib.orders[-1].orderType == "MKT"
+    assert ib.orders[-1].totalQuantity == 100
+
+
+def test_expected_stop_cancel_during_flatten_does_not_submit_second_flatten():
+    ib = _IB()
+    logger = _Logger()
+    receiver = _Receiver()
+    broker = SharedBroker(ib, {"NVDA": _Contract("NVDA")}, PositionRegistry(), logger)
+
+    broker._place(receiver, "NVDA", "entry-1", "entry", _Order("BUY", 20, limit_price=209.0))
+    broker._on_fill("entry-1", _Fill(20, 209.0))
+    broker._place(receiver, "NVDA", "stop-2", "stop", _Order("SELL", 20, order_type="STP", stop_price=208.0))
+    stop_trade = ib.trade_list[-1]
+
+    # A max-hold flatten cancels the protective stop before submitting its
+    # market sell. IB reports PendingCancel and Cancelled as separate events.
+    broker._place(receiver, "NVDA", "flatten-3", "flatten", _Order("SELL", 20, order_type="MKT"))
+    assert "stop-2" in broker._expected_exit_cancels
+
+    stop_trade.orderStatus.status = "PendingCancel"
+    ib.orderStatusEvent.fire(stop_trade)
+    assert "stop-2" in broker._expected_exit_cancels
+
+    stop_trade.orderStatus.status = "Cancelled"
+    ib.orderStatusEvent.fire(stop_trade)
+
+    flatten_orders = [order for order in ib.orders if order.orderType == "MKT"]
+    assert len(flatten_orders) == 1
+    assert "stop-2" not in broker._expected_exit_cancels
+    assert not any(event[0] == "exit_order_cancelled_flatten" for event in logger.events)
+    assert not any(event[0] == "forced_flatten_submitted" for event in logger.events)
+
+
+def test_shared_broker_rejects_second_working_flatten_for_same_position():
+    ib = _IB()
+    logger = _Logger()
+    receiver = _Receiver()
+    broker = SharedBroker(ib, {"NVDA": _Contract("NVDA")}, PositionRegistry(), logger)
+
+    broker._place(receiver, "NVDA", "entry-1", "entry", _Order("BUY", 20, limit_price=209.0))
+    broker._on_fill("entry-1", _Fill(20, 209.0))
+    broker._place(receiver, "NVDA", "flatten-2", "flatten", _Order("SELL", 20, order_type="MKT"))
+    broker._place(receiver, "NVDA", "flatten-3", "flatten", _Order("SELL", 20, order_type="MKT"))
+
+    flatten_orders = [order for order in ib.orders if order.orderType == "MKT"]
+    assert len(flatten_orders) == 1
+    duplicate = next(event[1] for event in logger.events if event[0] == "duplicate_flatten_rejected")
+    assert duplicate["order_id"] == "flatten-3"
+    assert duplicate["working_order_id"] == "flatten-2"
+
+
+def test_long_only_broker_immediately_covers_an_unexpected_flatten_overfill():
+    ib = _IB()
+    logger = _Logger()
+    receiver = _Receiver()
+    broker = SharedBroker(ib, {"NVDA": _Contract("NVDA")}, PositionRegistry(), logger)
+    broker._market_order = lambda side, qty: _Order(side, qty, order_type="MKT")
+
+    broker._place(receiver, "NVDA", "entry-1", "entry", _Order("BUY", 20, limit_price=209.0))
+    broker._on_fill("entry-1", _Fill(20, 209.0))
+    broker._place(receiver, "NVDA", "flatten-2", "flatten", _Order("SELL", 20, order_type="MKT"))
+
+    # Simulate an authoritative broker fill exceeding the remaining long.
+    broker._on_fill("flatten-2", _Fill(25, 209.16))
+
+    cover = ib.orders[-1]
+    assert cover.action == "BUY"
+    assert cover.orderType == "MKT"
+    assert cover.totalQuantity == 5
+    assert broker.short_positions[("absorption", "NVDA")] == 5
+    assert any(event == "long_only_short_emergency_cover" for event, _ in logger.events)
+
+
+def test_account_level_flatten_covers_quarantined_short_even_when_positions_are_unmanaged():
+    ib = _IB()
+    ib.account_positions = [_Position("NVDA", -20, 200.55)]
+    logger = _Logger()
+    broker = SharedBroker(
+        ib,
+        {"NVDA": _Contract("NVDA")},
+        PositionRegistry(),
+        logger,
+        manage_account_positions=False,
+    )
+    broker._market_order = lambda side, qty: _Order(side, qty, order_type="MKT")
+
+    submitted = broker.flatten_account_positions(
+        datetime(2026, 7, 23, 13, 29, tzinfo=timezone.utc),
+        "startup_position_close",
+    )
+
+    assert submitted == 1
+    assert [(order.action, order.totalQuantity) for order in ib.orders] == [("BUY", 20)]
+    assert broker.short_positions[("account", "NVDA")] == 20
+
+
+def test_shared_broker_does_not_flatten_when_target_is_cancelled_unexpectedly():
+    ib = _IB()
+    logger = _Logger()
+    receiver = _Receiver()
+    broker = SharedBroker(ib, {"NVDA": _Contract("NVDA")}, PositionRegistry(), logger)
+    broker._market_order = lambda side, qty: _Order(side, qty, order_type="MKT")
+
+    broker._place(receiver, "NVDA", "entry-1", "entry", _Order("BUY", 100, limit_price=210.0))
+    broker._on_fill("entry-1", _Fill(100, 210.0))
+    broker._place(receiver, "NVDA", "tp1-2", "tp1", _Order("SELL", 40, limit_price=211.0))
+    broker._place(receiver, "NVDA", "stop-3", "stop", _Order("SELL", 100, order_type="STP", stop_price=208.0))
+
+    target_trade = ib.trade_list[-2]
+    target_trade.orderStatus.status = "Cancelled"
+    ib.orderStatusEvent.fire(target_trade)
+
+    assert any(e[0] == "exit_order_cancelled_no_flatten" for e in logger.events)
+    assert not any(e[0] == "exit_order_cancelled_flatten" for e in logger.events)
+    assert not any(e[0] == "forced_flatten_submitted" for e in logger.events)
+    assert broker.exit_reservations_by_ref.get("tp1-2", 0) == 0
+
+
+def test_runner_promotion_never_amends_already_filled_tp1_after_tp2_fill():
+    ib = _IB()
+    logger = _Logger()
+    receiver = _Receiver()
+    broker = SharedBroker(ib, {"TSLA": _Contract("TSLA")}, PositionRegistry(), logger)
+
+    broker._place(receiver, "TSLA", "entry-1", "entry", _Order("BUY", 65, limit_price=379.0))
+    broker._on_fill("entry-1", _Fill(65, 379.0))
+    broker._place(receiver, "TSLA", "tp1-2", "tp1", _Order("SELL", 13, limit_price=380.42))
+    broker._place(receiver, "TSLA", "tp2-3", "tp2", _Order("SELL", 27, limit_price=381.84))
+    broker._place(receiver, "TSLA", "stop-4", "stop", _Order("SELL", 40, order_type="STP", stop_price=378.04))
+
+    broker._on_fill("tp1-2", _Fill(13, 380.42))
+    tp1_trade = next(trade for trade in ib.trade_list if trade.order.orderRef == "tp1-2")
+    tp1_trade.orderStatus.status = "Filled"
+    tp1_trade.orderStatus.remaining = 0
+    modifications_before = list(ib.modifications)
+
+    broker._on_fill("tp2-3", _Fill(27, 381.84))
+
+    assert ("tp2-3", 27, 381.84) in receiver.fills
+    assert any(name == "fills" and row["order_id"] == "tp2-3" for name, row in logger.rows)
+    assert tp1_trade.order not in ib.modifications[len(modifications_before):]
+    assert not any(event == "runner_target_promoted" and payload["order_id"] == "tp1-2" for event, payload in logger.events)
+
+
+def test_fill_is_logged_and_delivered_when_post_fill_maintenance_raises():
+    ib = _IB()
+    logger = _Logger()
+    receiver = _Receiver()
+    broker = SharedBroker(ib, {"NVDA": _Contract("NVDA")}, PositionRegistry(), logger)
+    broker._place(receiver, "NVDA", "entry-1", "entry", _Order("BUY", 10, limit_price=200.0))
+
+    def fail_stop_sync(*args, **kwargs):
+        raise RuntimeError("simulated amendment failure")
+
+    broker._sync_stop_quantity = fail_stop_sync
+    broker._on_fill("entry-1", _Fill(10, 200.0))
+
+    assert receiver.fills == [("entry-1", 10, 200.0)]
+    assert any(name == "fills" and row["order_id"] == "entry-1" for name, row in logger.rows)
+    assert any(event == "post_fill_maintenance_failed" for event, _ in logger.events)
+
+
+def test_unmanaged_position_is_quarantined_without_being_managed_or_flattened():
+    ib = _IB()
+    ib.account_positions = [_Position("NVDA", -20, 200.55)]
+    logger = _Logger()
+    registry = PositionRegistry()
+    broker = SharedBroker(
+        ib,
+        {"NVDA": _Contract("NVDA")},
+        registry,
+        logger,
+        manage_account_positions=False,
+        quarantine_unmanaged_positions=True,
+    )
+    now = datetime(2026, 7, 17, 13, 29, tzinfo=timezone.utc)
+
+    broker.sync_account_positions(now)
+
+    assert broker.unmanaged_positions == {"NVDA": -20}
+    assert broker.entry_block_reason("NVDA", "absorption") == "unmanaged_account_position"
+    assert registry.owner("NVDA") == "account"
+    assert broker.has_open_positions() is False
+    assert ib.orders == []
+
+    ib.account_positions = []
+    broker.sync_account_positions(now + timedelta(seconds=30))
+    assert broker.unmanaged_positions == {}
+    assert registry.owner("NVDA") is None
+
+
+def test_account_reconciliation_subtracts_strategy_inventory_before_quarantine():
+    ib = _IB()
+    logger = _Logger()
+    receiver = _Receiver()
+    broker = SharedBroker(
+        ib,
+        {"NVDA": _Contract("NVDA")},
+        PositionRegistry(),
+        logger,
+        manage_account_positions=False,
+    )
+    broker._place(receiver, "NVDA", "entry-1", "entry", _Order("BUY", 100, limit_price=200.0))
+    broker._on_fill("entry-1", _Fill(100, 200.0))
+    ib.account_positions = [_Position("NVDA", 80, 200.0)]
+
+    broker.sync_account_positions(datetime(2026, 7, 17, 13, 35, tzinfo=timezone.utc))
+
+    assert broker.unmanaged_positions == {"NVDA": -20}
+    event = next(payload for name, payload in logger.events if name == "unmanaged_position_quarantined")
+    assert event["account_quantity"] == 80
+    assert event["managed_quantity"] == 100
+
+
+def test_depth_permission_error_blocks_only_depth_dependent_strategies():
+    ib = _IB()
+    logger = _Logger()
+    broker = SharedBroker(
+        ib,
+        {"NVDA": _Contract("NVDA")},
+        PositionRegistry(),
+        logger,
+        fail_closed_on_depth_permission_error=True,
+    )
+
+    broker._on_ib_error_event(10, 2152, "Need additional market data permissions", _Contract("NVDA"))
+
+    assert broker.entry_block_reason("NVDA", "absorption") == "depth_permissions_unavailable"
+    assert broker.entry_block_reason("NVDA", "pullback") == "depth_permissions_unavailable"
+    assert broker.entry_block_reason("NVDA", "opening_range") is None
+    assert any(name == "depth_strategy_symbol_blocked" for name, _ in logger.events)
+
+
+def test_depth_permission_error_does_not_block_l1_pullback():
+    ib = _IB()
+    logger = _Logger()
+    broker = SharedBroker(
+        ib,
+        {"NVDA": _Contract("NVDA")},
+        PositionRegistry(),
+        logger,
+        fail_closed_on_depth_permission_error=True,
+        depth_required_strategies={"absorption"},
+    )
+
+    broker._on_ib_error_event(10, 2152, "Need additional market data permissions", _Contract("NVDA"))
+
+    assert broker.entry_block_reason("NVDA", "absorption") == "depth_permissions_unavailable"
+    assert broker.entry_block_reason("NVDA", "pullback") is None
+
+
+def test_depth_permission_error_does_not_block_entries_by_default():
+    ib = _IB()
+    logger = _Logger()
+    broker = SharedBroker(ib, {"NVDA": _Contract("NVDA")}, PositionRegistry(), logger)
+
+    broker._on_ib_error_event(10, 2152, "Need additional market data permissions", _Contract("NVDA"))
+
+    assert broker.entry_block_reason("NVDA", "absorption") is None
+    assert broker.entry_block_reason("NVDA", "pullback") is None
+    assert not any(name == "depth_strategy_symbol_blocked" for name, _ in logger.events)
+
+
+def test_loss_stop_starts_configured_symbol_cooldown():
+    ib = _IB()
+    logger = _Logger()
+    receiver = _Receiver()
+    broker = SharedBroker(ib, {"NVDA": _Contract("NVDA")}, PositionRegistry(), logger, stop_loss_cooldown_seconds=600)
+    broker._place(receiver, "NVDA", "entry-1", "entry", _Order("BUY", 10, limit_price=200.0))
+    broker._on_fill("entry-1", _Fill(10, 200.0))
+    broker._place(receiver, "NVDA", "stop-2", "stop", _Order("SELL", 10, order_type="STP", stop_price=199.0))
+    fill = _Fill(10, 198.95)
+
+    broker._on_fill("stop-2", fill)
+
+    assert broker.is_symbol_cooling_down("NVDA", fill.execution.time + timedelta(minutes=5)) is True
+    event = next(payload for name, payload in logger.events if name == "symbol_cooldown_started")
+    assert event["reason"] == "stop_loss"
+    assert event["seconds"] == 600

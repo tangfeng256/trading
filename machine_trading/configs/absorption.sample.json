@@ -5,7 +5,7 @@
     "client_id": 17,
     "connect_timeout_sec": 15
   },
-  "symbols": ["NVDA", "TSLA", "AMD", "TQQQ"],
+  "symbols": ["NVDA", "TSLA", "MU", "TQQQ"],
   "market": {
     "exchange": "SMART",
     "currency": "USD",
@@ -30,9 +30,9 @@
   "risk": {
     "account_equity": 50000,
     "risk_per_trade_pct": 0.0025,
-    "max_daily_loss_pct": 0.01,
+    "max_daily_loss_pct": 0.04,
     "max_notional": 25000,
-    "max_trades_per_day": 3,
+    "max_trades_per_day": 6,
     "min_stop_bps": 5,
     "max_stop_bps": 60
   },
@@ -43,7 +43,8 @@
     "tp1_r_multiple": 1.0,
     "tp1_fraction": 0.5,
     "tp2_r_multiple": 2.0,
-    "move_stop_to_breakeven_after_tp1": true
+    "move_stop_to_breakeven_after_tp1": true,
+    "protective_order_delay_seconds": 1.0
   },
   "logging": {
     "root": "runs",

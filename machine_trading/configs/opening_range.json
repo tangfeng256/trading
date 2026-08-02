@@ -1,6 +1,6 @@
 {
   "strategy": {
-    "symbols": ["NVDA", "TSLA", "AMD", "AAPL", "TQQQ"],
+    "symbols": ["NVDA", "TSLA", "MU", "AAPL", "TQQQ"],
     "or_start": "09:30",
     "or_end": "09:45",
     "trade_start": "09:45",
@@ -34,8 +34,8 @@
   "risk": {
     "account_size": 50000.0,
     "risk_per_trade_pct": 0.003,
-    "max_daily_loss_pct": 0.01,
-    "max_trades_per_day": 3,
+    "max_daily_loss_pct": 0.04,
+    "max_trades_per_day": 6,
     "max_total_positions": 3,
     "max_position_notional": 25000.0,
     "min_stop_bps": 8.0,

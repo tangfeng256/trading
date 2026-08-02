@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +22,7 @@ from absorption.risk_manager import RiskManager as AbsRiskManager  # noqa: E402
 from absorption.signal_engine import SignalEngine as AbsSignalEngine  # noqa: E402
 from absorption.tape import Tape  # noqa: E402
 from absorption.order_state import TradeStatus as AbsTradeStatus  # noqa: E402
+from absorption.pricing import round_to_tick  # noqa: E402
 from pullback_trend.config import load_config as load_pullback_config  # noqa: E402
 from pullback_trend.execution import _append_bar as pullback_append_bar  # noqa: E402
 from pullback_trend.logger import AuditLogger as PullbackLogger  # noqa: E402
@@ -102,6 +103,7 @@ class AbsorptionAdapter(StrategyAdapter):
         self.risk = AbsRiskManager(self.config.risk, self.config.strategy)
         self.execution = AbsExecutionManager(self.config.execution, self.config.market, self.config.strategy)
         self.last_feature_at: dict[str, datetime] = {}
+        self._pending_protective_orders: list[tuple[datetime, Any]] = []
 
     def symbols(self) -> set[str]:
         return set(self.books)
@@ -127,13 +129,23 @@ class AbsorptionAdapter(StrategyAdapter):
             self.tapes[symbol].add_trade(timestamp, price, size, bid=bid, ask=ask)
 
     def poll(self, now: datetime, allow_new_entries: bool = True) -> None:
+        self._flush_pending_protective_orders(now)
         for order in self.execution.cancel_stale_entries(now):
             self.broker.cancel(order.order_id)
+            trade = self.execution._trade_for_order(order.order_id)
+            if trade is not None and trade.status == AbsTradeStatus.PENDING_ENTRY:
+                trade.status = AbsTradeStatus.CLOSED
+                self.risk.mark_trade_closed(order.symbol, now, 0.0, filled=False)
+                self.registry.unlock_if_owner(order.symbol, self.strategy_name)
         for order in self.execution.flatten_expired_positions(now):
             self.broker.submit_absorption_order(self, order)
         if not allow_new_entries:
             return
         for symbol in self.config.symbols:
+            blocked_reason = _entry_block_reason(self.broker, symbol, self.strategy_name)
+            if blocked_reason:
+                self.logger.event("strategy_skip_entry_blocked", {"strategy": self.strategy_name, "symbol": symbol, "reason": blocked_reason, "time": now.isoformat()})
+                continue
             if self.broker.is_symbol_cooling_down(symbol, now):
                 self.logger.event("strategy_skip_cooldown", {"strategy": self.strategy_name, "symbol": symbol, "time": now.isoformat()})
                 continue
@@ -167,17 +179,52 @@ class AbsorptionAdapter(StrategyAdapter):
             if symbol:
                 self._close_symbol_after_broker_flatten(symbol, timestamp, price)
             return
-        created = self.execution.on_fill(order_id, quantity, price, timestamp)
-        order = self.execution.orders[order_id]
-        if order.side == "BUY":
-            self.registry.lock_position(order.symbol, self.strategy_name, timestamp)
-        for child in created:
-            self.broker.submit_absorption_order(self, child)
         _get_trade = getattr(self.execution, "_trade_for_order", None)
         trade = _get_trade(order_id) if _get_trade else None
+        pnl_before = trade.realized_pnl if trade is not None else 0.0
+        created = self.execution.on_fill(order_id, quantity, price, timestamp)
+        order = self.execution.orders[order_id]
+        if trade is not None:
+            realized_delta = trade.realized_pnl - pnl_before
+            if realized_delta:
+                self.risk.record_realized_pnl(timestamp, realized_delta)
+        if order.side == "BUY":
+            self.registry.lock_position(order.symbol, self.strategy_name, timestamp)
+            if trade is not None:
+                protective_orders = [candidate for candidate in trade.orders.values() if candidate.side == "SELL"]
+                sync_quantities = getattr(self.broker, "sync_protective_order_quantities", None)
+                if sync_quantities is not None:
+                    sync_quantities(self, protective_orders)
+        # IB's paper-trading engine hasn't registered the entry fill's position
+        # update yet at this instant, so a protective SELL submitted immediately
+        # gets silently stuck or cancelled (see SharedBroker.resubmit_unacknowledged_exits).
+        # Delaying submission by a beat lets the paper account catch up before we ask
+        # it to sell, so tp1/tp2/stop actually work instead of forcing a market flatten.
+        if created:
+            if not hasattr(self, "_pending_protective_orders"):
+                self._pending_protective_orders = []
+            delay = timedelta(seconds=self.config.execution.protective_order_delay_seconds)
+            for child in created:
+                self._pending_protective_orders.append((timestamp + delay, child))
         if trade and not trade.is_active:
-            self.risk.mark_trade_closed(trade.symbol, timestamp, trade.realized_pnl)
+            self.risk.mark_trade_closed(trade.symbol, timestamp, 0.0)
             self.registry.unlock_if_owner(trade.symbol, self.strategy_name)
+
+    def on_broker_commission(self, timestamp: datetime, commission: float) -> None:
+        if commission:
+            self.risk.record_realized_pnl(timestamp, -abs(commission))
+
+    def _flush_pending_protective_orders(self, now: datetime) -> None:
+        pending = getattr(self, "_pending_protective_orders", None)
+        if not pending:
+            return
+        remaining: list[tuple[datetime, Any]] = []
+        for ready_at, order in pending:
+            if now >= ready_at:
+                self.broker.submit_absorption_order(self, order)
+            else:
+                remaining.append((ready_at, order))
+        self._pending_protective_orders = remaining
 
     def _symbol_from_broker_flatten(self, order_id: str) -> str | None:
         prefix = f"flatten-{self.strategy_name}-"
@@ -214,9 +261,9 @@ class AbsorptionAdapter(StrategyAdapter):
         realized_vol = max(0.0, float(features.get("realized_volatility", 0.0) or 0.0))
         volatility_floor = entry * realized_vol * ABSORPTION_VOL_STOP_MULTIPLE
         stop_distance = max(structure_distance, bps_floor, volatility_floor, ABSORPTION_MIN_STOP_DOLLARS, tick_size)
-        new_stop = round(entry - stop_distance, 4)
-        new_tp1 = round(entry + stop_distance * ABSORPTION_TP1_R_MULTIPLE, 4)
-        new_tp2 = round(entry + stop_distance * ABSORPTION_TP2_R_MULTIPLE, 4)
+        new_stop = round_to_tick(entry - stop_distance, tick_size, "down")
+        new_tp1 = round_to_tick(entry + stop_distance * ABSORPTION_TP1_R_MULTIPLE, tick_size, "up")
+        new_tp2 = round_to_tick(entry + stop_distance * ABSORPTION_TP2_R_MULTIPLE, tick_size, "up")
         if new_stop == signal.stop_price and new_tp1 == signal.target1_price and new_tp2 == signal.target2_price:
             return signal
         self.logger.event(
@@ -298,6 +345,10 @@ class PullbackAdapter(StrategyAdapter):
         if not allow_new_entries:
             return
         if symbol == self.config.strategy.market_symbol or symbol not in self.config.strategy.symbols:
+            return
+        blocked_reason = _entry_block_reason(self.broker, symbol, self.strategy_name)
+        if blocked_reason:
+            self.logger.event("strategy_skip_entry_blocked", {"strategy": self.strategy_name, "symbol": symbol, "reason": blocked_reason, "time": now.isoformat()})
             return
         if self.broker.is_symbol_cooling_down(symbol, now):
             self.logger.event("strategy_skip_cooldown", {"strategy": self.strategy_name, "symbol": symbol, "time": now.isoformat()})
@@ -389,6 +440,11 @@ class OpeningRangeAdapter(StrategyAdapter):
             return
         if symbol not in self.config.strategy.symbols:
             return
+        blocked_reason = _entry_block_reason(self.broker, symbol, self.strategy_name)
+        if blocked_reason:
+            self.logger.event("strategy_skip_entry_blocked", {"strategy": self.strategy_name, "symbol": symbol, "reason": blocked_reason, "time": orm_bar.timestamp.isoformat()})
+            self.execution.reconcile(orm_bar.timestamp)
+            return
         if self.broker.is_symbol_cooling_down(symbol, orm_bar.timestamp):
             self.logger.event("strategy_skip_cooldown", {"strategy": self.strategy_name, "symbol": symbol, "time": orm_bar.timestamp.isoformat()})
             self.execution.reconcile(orm_bar.timestamp)
@@ -419,6 +475,11 @@ def _bar_time(bar: Any) -> datetime:
     raw = getattr(bar, "date", None) or getattr(bar, "time", None) or getattr(bar, "timestamp", None)
     ts = pd.Timestamp(raw).to_pydatetime() if raw is not None else datetime.now(timezone.utc)
     return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+
+
+def _entry_block_reason(broker: Any, symbol: str, strategy: str) -> str | None:
+    callback = getattr(broker, "entry_block_reason", None)
+    return callback(symbol, strategy) if callback is not None else None
 
 
 def _bar_row(symbol: str, bar: Any) -> dict[str, Any]:
